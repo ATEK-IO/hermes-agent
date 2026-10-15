@@ -140,6 +140,25 @@ _BILLING_ERROR_CODES = frozenset({
     "insufficient_credits_for_paid_model",
 })
 
+# A *terminal* budget wall: LiteLLM's per-end-user / per-key budget override, which no retry
+# can clear until the budget window resets. LiteLLM returns it as HTTP 429 with code 429 and
+# type ``budget_exceeded`` — the shape that otherwise classifies as ``rate_limit`` and retries
+# into the wall. Named narrowly on the *vendor's* vocabulary (the ``budget_exceeded`` type, the
+# ``budget exceeded`` / ``exceededbudget`` prefix) so a generic provider quota wall is untouched.
+# Not a credential problem either: the credential is healthy, the budget behind it is spent, so
+# rotating the pool cannot recover it (ATE-4494).
+_BUDGET_EXHAUSTED_PATTERNS = (
+    "exceededbudget", "budget_exceeded", "budget exceeded", "maximum budget", "max budget",
+    "budget has been exceeded", "over budget",
+)
+
+# Only a *windowed* budget recovers by waiting — "1d"/"daily"/"per day" resets at the window
+# boundary. A "monthly"/"30d" wall is days away; the retry budget must not be spent on it.
+_BUDGET_RESET_SOON_PATTERNS = (
+    "daily", "per day", "1 day", "1d window", "today", "resets in", "reset in", "resets at",
+    "resets at midnight", "hourly", "per hour",
+)
+
 # Transient rate limiting. Bedrock "Throttling error: Too many tokens" also
 # contains an overflow phrase; rate limit is matched first so throttle wins.
 _RATE_LIMIT_PATTERNS = (
@@ -1061,6 +1080,21 @@ def _status_429(c: _Ctx) -> Verdict:
     # this handler always returns, so _by_error_code never sees the code.
     if c.code in _BILLING_ERROR_CODES:
         return _V_BILLING
+    # A *budget* wall also arrives as 429 (LiteLLM per-end-user/key budget:
+    # type ``budget_exceeded``, code 429). It is terminal for the window, not
+    # throttling: retrying re-hits the same spent budget and burns the whole
+    # retry budget on a condition no retry can clear (ATE-4494 measured ~470
+    # runs/3 h retrying into a dead budget). Billing verdict ⇒ non-retryable,
+    # no pool rotation, straight to the terminal path that records the cap.
+    if any(p in c.msg for p in _BUDGET_EXHAUSTED_PATTERNS):
+        reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
+        if reset is None and any(p in c.msg.lower() for p in _BUDGET_RESET_SOON_PATTERNS):
+            # A windowed (daily/hourly) budget resets at a known boundary: allow
+            # exactly one short-TTL pool rotation so the caller can name the wall
+            # instead of silently ending the run.
+            reset = 2.0
+        ctx = {"reset_at": time.time() + reset} if reset else {}
+        return _v(_R.billing, retryable=False, should_fallback=False, error_context=ctx)
     # Z.AI/Zhipu reuse 429 for server-wide overload: back off on the same
     # key instead of burning the pool (#14038).
     if any(p in c.msg for p in _OVERLOADED_PATTERNS):
