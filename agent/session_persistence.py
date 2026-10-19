@@ -162,8 +162,12 @@ def _persist_lock(agent):
 _LOCK_RETRY_MAX_BATCHES = 32
 _LOCK_RETRY_BASE_DELAY_S = 0.25
 _LOCK_RETRY_MAX_DELAY_S = 3.0
-_LOCK_RETRY_MAX_ATTEMPTS = 40
+# The AGE is the binding bound: a batch may wait up to ``_LOCK_RETRY_MAX_AGE_S`` and then gives up.
+# ``_LOCK_RETRY_MAX_ATTEMPTS`` is only a runaway net, sized above the most attempts 600 s can need at the
+# 3.0 s cap with the minimum 0.6 jitter factor (600 / 1.8 = 334), so it never ends a retry the age still
+# allows.  The last sleep is clipped to the remaining age, so no attempt starts past the deadline.
 _LOCK_RETRY_MAX_AGE_S = 600.0
+_LOCK_RETRY_MAX_ATTEMPTS = 400
 # One attempt must be cheap: the queue owns the waiting, not the SQLite busy loop.  Kept short so many
 # attempts fit inside a caller's transcript patience window.
 _LOCK_RETRY_ATTEMPT_PATIENCE_S = 1.5
@@ -249,6 +253,23 @@ class _LockRetryQueue:
         with self._cond:
             return not self._entries
 
+    def wait_settled(self, session_id: Optional[str], timeout: float) -> bool:
+        """Block until no batch for ``session_id`` is pending; True when settled, False on timeout.
+
+        The LIVE flush calls this before it takes the persist lock: a batch for this session may still be
+        waiting for the lock, and the live rows must not land ahead of it (the queue is the per-session
+        FIFO).  The caller must NOT hold ``_persist_lock`` — the worker needs that same lock to land the
+        queued batch, so waiting under it would stall until the timeout.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._cond:
+            while any(entry["session_id"] == session_id for entry in self._entries):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(min(remaining, 0.25))
+        return True
+
     def reset(self) -> None:
         """Test helper: forget pending batches and counters."""
         with self._cond:
@@ -280,11 +301,13 @@ class _LockRetryQueue:
                     with self._cond:
                         if self._entries and self._entries[0] is entry:
                             self._entries.popleft()
+                            self._cond.notify_all()  # wake a live flush waiting on this session's FIFO
                         else:  # dropped by a full queue while we waited
                             for i, other in enumerate(self._entries):
                                 if other is entry:
                                     del self._entries[i]
                                     break
+                            self._cond.notify_all()
                     break
                 time.sleep(wait_s)
 
@@ -303,8 +326,13 @@ class _LockRetryQueue:
                     return None  # a live flush already landed these rows while this batch waited
                 entry["batch_rows"] = [row for row, _ in pending]
                 entry["batch_msgs"] = [msg for _, msg in pending]
-                _db_flush_write(agent, entry["batch_rows"], entry["batch_msgs"], [],
-                                patience_s=_LOCK_RETRY_ATTEMPT_PATIENCE_S)
+                # B1: write the session the batch was COLLECTED for, not whatever the agent is bound to
+                # now — a compression-tip adoption can rebind the agent while the batch waits.  m1: pass
+                # the batch dicts as the live transcript too, so the shadowed-checkpoint drop the insert
+                # performs is mirrored on the messages this batch owns (``messages=[]`` mirrored nothing).
+                _db_flush_write(agent, entry["batch_rows"], entry["batch_msgs"], entry["batch_msgs"],
+                                patience_s=_LOCK_RETRY_ATTEMPT_PATIENCE_S,
+                                session_id=entry["session_id"] or getattr(agent, "session_id", None))
         except Exception as e:
             entry["attempts"] += 1
             try:
@@ -312,11 +340,12 @@ class _LockRetryQueue:
             except Exception:
                 cause = "unknown"
             _age = time.monotonic() - entry["enqueued_at"]
-            if (cause == "locked" and entry["attempts"] < _LOCK_RETRY_MAX_ATTEMPTS
-                    and _age < _LOCK_RETRY_MAX_AGE_S):
+            _remaining = _LOCK_RETRY_MAX_AGE_S - _age
+            if (cause == "locked" and _remaining > 0
+                    and entry["attempts"] < _LOCK_RETRY_MAX_ATTEMPTS):
                 logger.debug("Transcript retry %d for session %s still locked (%0.1fs): %s",
                              entry["attempts"], entry["session_id"], _age, e)
-                return _lock_retry_delay(entry["attempts"])
+                return min(_lock_retry_delay(entry["attempts"]), _remaining)
             _emit_persistence_gave_up(
                 agent, cause,
                 f"{cause} after {entry['attempts']} attempt(s) over {_age:0.1f}s "
@@ -482,12 +511,18 @@ def _db_flush_collect(agent, messages: list[dict], conversation_history: Optiona
 
 
 def _db_flush_write(agent, batch_rows: list[dict[str, Any]], batch_msgs: list[dict], messages: list[dict],
-                    patience_s: Optional[float] = None) -> None:
-    """One transaction for the turn's new rows: on failure nothing lands and no markers are stamped."""
+                    patience_s: Optional[float] = None, session_id: Optional[str] = None) -> None:
+    """One transaction for the turn's new rows: on failure nothing lands and no markers are stamped.
+
+    ``session_id`` is the session the batch was COLLECTED for.  The retry queue must pass it: the agent can
+    be rebound to another session (a compression-tip adoption) between enqueue and the retry, and the rows
+    belong to the session that produced them, not to whatever the agent is bound to when the lock frees.
+    Live callers omit it and write their current session.
+    """
     if not batch_rows:
         return
     agent._session_db.append_messages_batch(
-        session_id=agent.session_id, messages=batch_rows,
+        session_id=session_id or agent.session_id, messages=batch_rows,
         compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
         turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
         turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
@@ -669,15 +704,29 @@ class SessionPersistenceMixin:
         if platform_id is not None:  # load-bearing for restart drain-window recovery dedup (has_platform_message_id)
             msg["platform_message_id"] = platform_id
 
-    def _persist_session(self, messages: list[dict], conversation_history: list[dict] | None = None):
+    def _persist_session(self, messages: list[dict], conversation_history: list[dict] | None = None,
+                         queue_on_lock: bool = True):
         """Save to SQLite on any exit path. Trailing empty-response scaffolding is dropped from
         the live list; the persist override is applied to the DB row only.
+
+        ``queue_on_lock`` belongs to TURN-END callers only, whose reply already exists.  A SHUTDOWN / EXIT
+        flush (gateway finalize, session reaper, atexit) must pass ``False``: the retry worker is a daemon
+        thread, so a batch parked there at interpreter exit dies with the process — those callers wait the
+        lock out in-process (bounded at ``_LOCK_TURN_WAIT_S``) exactly as before the retry queue existed.
 
         The persist user-message *override* is NOT applied here — it is resolved inside
         ``_flush_messages_to_session_db`` and written only to the DB row, never mutating the live message
         list used by the API call (#48677 is thus closed for every persist caller, not just this one).
         """
         from agent.agent_runtime_helpers import note_turn_persisted
+        turn_wait_s = _LOCK_TURN_WAIT_S
+        if not queue_on_lock:
+            # Settle this session's FIFO BEFORE taking the persist lock (the worker needs that lock).
+            # Whatever the settle costs comes out of the SAME 60 s an exit flush always had, so the
+            # shutdown path is never slower than the single busy-wait the queue replaced.
+            started = time.monotonic()
+            _lock_retry_queue.wait_settled(getattr(self, "session_id", None), turn_wait_s)
+            turn_wait_s = max(0.0, turn_wait_s - (time.monotonic() - started))
         with _persist_lock(self):
             # Only the scaffolding goes here. Closing a tool tail this uncovers is the exit
             # owner's job (``_close_transcript_tail``, ``abort_turn_on_interrupt``): only it knows
@@ -685,7 +734,11 @@ class SessionPersistenceMixin:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             # TURN END: a locked write is a WAIT, not a lost reply — park the batch and let it land later.
-            self._flush_messages_to_session_db(messages, conversation_history, queue_on_lock=True)
+            # An EXIT caller (``queue_on_lock=False``) waits instead: a daemon-thread batch does not survive
+            # interpreter exit, and the FIFO was already settled above.
+            self._flush_messages_to_session_db(messages, conversation_history,
+                                               queue_on_lock=queue_on_lock, _settle_waited=True,
+                                               turn_wait_s=turn_wait_s)
             # Drain async token-accounting deltas at every persist point; cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
@@ -705,19 +758,32 @@ class SessionPersistenceMixin:
     _repair_message_sequence = _forward("agent.agent_runtime_helpers", "repair_message_sequence")
 
     def _flush_messages_to_session_db(self, messages: list[dict], conversation_history: Optional[list[dict]] = None,
-                                      queue_on_lock: bool = False):
+                                      queue_on_lock: bool = False, _settle_waited: bool = False,
+                                      turn_wait_s: Optional[float] = None):
         """Serialize direct and turn-boundary session flushes per agent.
 
         ``queue_on_lock=True`` is for TURN-END callers (the reply already exists): a ``locked`` write parks
         the batch on the bounded retry queue and reports success, so the turn returns its reply. Mid-turn
-        callers keep the default (fail closed) — they must not run side effects from process-only state."""
+        callers keep the default (fail closed) — they must not run side effects from process-only state.
+
+        Before a direct write, an OLDER batch for this session that is still queued must land first: the
+        queue is the session's FIFO, and only the turn-end path used to check it, so a mid-turn or exit
+        flush could overtake a waiting batch and write the transcript out of order.  ``_settle_waited`` is
+        set by ``_persist_session``, which waits before it takes the lock (waiting under the lock would
+        stall the worker that has to land the batch)."""
+        budget_s = _LOCK_TURN_WAIT_S if turn_wait_s is None else turn_wait_s
+        if not queue_on_lock and not _settle_waited:
+            started = time.monotonic()
+            _lock_retry_queue.wait_settled(getattr(self, "session_id", None), budget_s)
+            budget_s = max(0.0, budget_s - (time.monotonic() - started))
         with _persist_lock(self):
             return self._flush_messages_to_session_db_unlocked(messages, conversation_history,
-                                                              queue_on_lock=queue_on_lock)
+                                                              queue_on_lock=queue_on_lock,
+                                                              turn_wait_s=budget_s)
 
     def _flush_messages_to_session_db_unlocked(
         self, messages: list[dict], conversation_history: Optional[list[dict]] = None, _adoption_budget: int = 1,
-        queue_on_lock: bool = False,
+        queue_on_lock: bool = False, turn_wait_s: float = _LOCK_TURN_WAIT_S,
     ):
         """Persist un-flushed messages to SQLite. Dedup is the intrinsic ``_DB_PERSISTED_MARKER`` on each written
         dict — not positional slices (drift after sequence repair) nor an ``id(msg)`` set (address reuse). The
@@ -754,7 +820,7 @@ class SessionPersistenceMixin:
             else:
                 # Mid-turn: the row must exist before tools run — wait the lock out, bounded, then fail.
                 _wait_error = _db_flush_write_with_lock_wait(self, batch_rows, batch_msgs, messages,
-                                                             _LOCK_TURN_WAIT_S)
+                                                             turn_wait_s)
                 if _wait_error is not None:
                     raise _wait_error
             self._session_row_replay_pending = None
@@ -773,7 +839,7 @@ class SessionPersistenceMixin:
                 return True
             # After a heal the pending replay re-sends the history prefix instead of stamping it durable.
             return self._flush_messages_to_session_db_unlocked(messages, conversation_history, _adoption_budget=0,
-                                                              queue_on_lock=queue_on_lock)
+                                                              queue_on_lock=queue_on_lock, turn_wait_s=turn_wait_s)
 
     def _get_messages_up_to_last_assistant(self, messages: list[dict]) -> list[dict]:
         """Messages before the last assistant turn (rollback point for a malformed final answer); all if none."""
