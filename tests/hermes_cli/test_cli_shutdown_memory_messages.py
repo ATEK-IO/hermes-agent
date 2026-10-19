@@ -139,6 +139,7 @@ def test_cli_close_preflush_resumed_prefix_is_not_duplicated(tmp_path, monkeypat
     def _pause_before_flush(
         messages: list[dict[str, Any]],
         conversation_history: list[dict[str, Any]] | None = None,
+        **kwargs,
     ) -> None:
         nonlocal flush_calls
         flush_calls += 1
@@ -155,6 +156,7 @@ def test_cli_close_preflush_resumed_prefix_is_not_duplicated(tmp_path, monkeypat
             agent,
             messages,
             conversation_history if conversation_history is not None else [],
+            **kwargs,
         )
 
     agent._flush_messages_to_session_db = _pause_before_flush

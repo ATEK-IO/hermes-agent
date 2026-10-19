@@ -262,7 +262,8 @@ def _flush_one_shot_session_store(cli) -> None:
     try:
         msgs = getattr(agent, "_session_messages", None)
         if isinstance(msgs, list) and msgs and hasattr(agent, "_persist_session"):
-            agent._persist_session(msgs, getattr(cli, "conversation_history", None))
+            # queue_on_lock=False: one-shot exit flush — no daemon worker survives it, so wait, do not park.
+            agent._persist_session(msgs, getattr(cli, "conversation_history", None), queue_on_lock=False)
     except Exception:
         logger.debug("one-shot final session persist retry failed", exc_info=True)
     db = getattr(agent, "_session_db", None) or getattr(cli, "_session_db", None)

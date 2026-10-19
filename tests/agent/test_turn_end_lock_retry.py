@@ -15,10 +15,20 @@ Contract pinned here:
    replay after a late landing cannot duplicate a row.
 4. The queue is bounded and drops the OLDEST batch with an error log, so a stalled database cannot
    grow memory.
+5. A queued batch lands in the session it was COLLECTED for, even if the agent was rebound to a
+   compression tip while it waited (B1, ATE-6552).
+6. ``_LOCK_RETRY_MAX_AGE_S`` is the binding bound: the attempt cap can never expire a batch the age
+   still allows, and the last sleep is clipped to the remaining age (M1).
+7. An EXIT flush (gateway finalize, reaper, atexit) waits the lock out in-process instead of parking
+   on a daemon thread that dies with the interpreter (M2).
+8. The retry mirrors the shadowed-checkpoint drop on the batch's own live dicts, not on ``[]`` (m1).
+9. The queue is the session's FIFO for BOTH writers: a live flush settles it before writing instead
+   of overtaking a waiting batch (m2).
 """
 
 import sqlite3
 import threading
+import time
 import types
 
 from unittest.mock import MagicMock
@@ -223,3 +233,163 @@ def test_retry_queue_is_bounded_and_drops_the_oldest(monkeypatch):
     assert queue.dropped == 1
     assert [e["session_id"] for e in queue._entries] == ["sess-bound-1", "sess-bound-2"]
     queue.reset()
+
+
+def test_queued_batch_lands_in_the_session_it_was_collected_for(tmp_path):
+    """B1 (ATE-6552 probe): a rebind after enqueue must not move the queued rows to the new session."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    original, rotated = "sess-ORIGINAL", "sess-ROTATED"
+    db.create_session(original, source="pytest")
+    db.create_session(rotated, source="pytest")
+    agent = _flush_agent(db, original)
+
+    real_write = db.append_messages_batch
+    calls = {"n": 0}
+
+    def _first_locked(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the live turn-end attempt hits the held lock, so the batch is queued
+            raise sqlite3.OperationalError("database is locked")
+        return real_write(*args, **kwargs)
+
+    db.append_messages_batch = _first_locked
+    messages = [{"role": "assistant", "content": "belongs to ORIGINAL"}]
+    assert agent._flush_messages_to_session_db(messages, [], queue_on_lock=True) is True
+    assert pending_lock_retries() == 1
+
+    # What _db_flush_adopt_compression_tip does while the batch waits.
+    agent.session_id = rotated
+    assert _lock_retry_queue.await_idle(10.0)
+
+    assert [m["content"] for m in db.get_messages_as_conversation(original)] == ["belongs to ORIGINAL"]
+    assert db.get_messages_as_conversation(rotated) == []
+
+
+def test_retry_age_is_the_binding_bound(monkeypatch):
+    """M1: the advertised 600 s must be reachable — the attempt cap must not expire a batch the age allows."""
+    # The autouse fixture shrinks the clock; put the shipped backoff numbers back for this invariant.
+    monkeypatch.setattr(session_persistence, "_LOCK_RETRY_BASE_DELAY_S", 0.25)
+    monkeypatch.setattr(session_persistence, "_LOCK_RETRY_MAX_DELAY_S", 3.0)
+
+    def _min_delay(attempt: int) -> float:
+        base = min(session_persistence._LOCK_RETRY_BASE_DELAY_S * (1.7 ** max(0, attempt)),
+                   session_persistence._LOCK_RETRY_MAX_DELAY_S)
+        return base * 0.6  # the jitter floor
+
+    reachable_s = sum(_min_delay(a) for a in range(session_persistence._LOCK_RETRY_MAX_ATTEMPTS))
+    assert reachable_s >= session_persistence._LOCK_RETRY_MAX_AGE_S
+
+
+def test_aged_retry_gives_up_on_the_age_and_clips_its_last_wait(monkeypatch):
+    """M1: the AGE ends the retry (the attempt cap is only a net), and no sleep starts past the deadline."""
+    monkeypatch.setattr(session_persistence, "_LOCK_RETRY_MAX_AGE_S", 10.0)
+    agent = _stub_agent("sess-aged")
+    msg = {"role": "assistant", "content": "x"}
+    entry = {"agent": agent, "session_id": "sess-aged",
+             "batch_rows": [{"role": "assistant", "content": "x"}], "batch_msgs": [msg],
+             "attempts": 0, "enqueued_at": time.monotonic() - 9.8}
+
+    wait_s = session_persistence._lock_retry_queue._attempt(entry)
+    assert wait_s is not None and 0 < wait_s <= 0.2  # clipped to the remaining age, not the 3 s cap
+    assert entry["attempts"] < session_persistence._LOCK_RETRY_MAX_ATTEMPTS
+
+    entry["enqueued_at"] = time.monotonic() - 10.5
+    assert session_persistence._lock_retry_queue._attempt(entry) is None
+    assert pending_lock_retries() == 0
+
+
+def test_exit_flush_waits_in_process_instead_of_parking_on_the_queue(tmp_path, monkeypatch):
+    """M2: a shutdown/exit flush must not hand its batch to a daemon thread that dies with the interpreter."""
+    monkeypatch.setattr(session_persistence, "_LOCK_TURN_WAIT_S", 0.2)
+
+    def _agent_with(locked_db, key):
+        agent = _flush_agent(locked_db, key)
+        agent._persist_session = AIAgent._persist_session.__get__(agent, AIAgent)
+        agent._drop_trailing_empty_response_scaffolding = (
+            AIAgent._drop_trailing_empty_response_scaffolding.__get__(agent, AIAgent))
+        return agent
+
+    def _always_locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    key = "sess-exit"
+    db.create_session(key, source="pytest")
+    db.append_messages_batch = _always_locked
+    agent = _agent_with(db, key)
+    messages = [{"role": "assistant", "content": "goodbye"}]
+
+    agent._persist_session(messages, queue_on_lock=False)  # exit caller: waits, returns, never raises
+    assert pending_lock_retries() == 0
+
+    # The turn-end default still parks the batch (the reply exists, the worker outlives the turn).
+    db2 = SessionDB(db_path=tmp_path / "state2.db")
+    key2 = "sess-turn-end"
+    db2.create_session(key2, source="pytest")
+    db2.append_messages_batch = _always_locked
+    agent2 = _agent_with(db2, key2)
+    agent2._persist_session([{"role": "assistant", "content": "reply"}])
+    assert pending_lock_retries() == 1
+
+
+def test_retry_mirrors_the_checkpoint_drop_on_the_live_transcript(tmp_path, monkeypatch):
+    """m1: the retry writes the batch dicts as the live transcript, so the checkpoint drop mirrors on them."""
+    seen = []
+    real_drop = session_persistence.drop_shadowed_checkpoints
+    monkeypatch.setattr(session_persistence, "drop_shadowed_checkpoints",
+                        lambda msgs: (seen.append(list(msgs)), real_drop(msgs))[1])
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    key = "sess-checkpoint"
+    db.create_session(key, source="pytest")
+    agent = _flush_agent(db, key)
+
+    real_write = db.append_messages_batch
+    calls = {"n": 0}
+
+    def _first_locked(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_write(*args, **kwargs)
+
+    db.append_messages_batch = _first_locked
+    msg = {"role": "assistant", "content": "carries a checkpoint",
+           "codex_reasoning_items": [{"type": "compaction", "id": "r1"}]}
+    assert agent._flush_messages_to_session_db([msg], [], queue_on_lock=True) is True
+    assert _lock_retry_queue.await_idle(10.0)
+
+    assert seen, "the checkpoint drop never ran on the retry path"
+    assert seen[-1] == [msg]  # was [] before the fix: the live dicts never saw the drop
+
+
+def test_live_flush_does_not_overtake_a_queued_batch(tmp_path):
+    """m2: the live writer must wait for an older queued batch, not race it into the transcript."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    key = "sess-fifo"
+    db.create_session(key, source="pytest")
+    agent = _flush_agent(db, key)
+
+    order = []
+    real_write = db.append_messages_batch
+    state = {"fail_next_queued": True}
+
+    def _record(*args, **kwargs):
+        content = ((kwargs.get("messages") or [{}])[0]).get("content")
+        if content == "queued" and state["fail_next_queued"]:
+            state["fail_next_queued"] = False  # the live turn-end attempt is the one that sees the lock
+            raise sqlite3.OperationalError("database is locked")
+        order.append(content)
+        return real_write(*args, **kwargs)
+
+    db.append_messages_batch = _record
+    assert agent._flush_messages_to_session_db([{"role": "assistant", "content": "queued"}], [],
+                                               queue_on_lock=True) is True
+    assert pending_lock_retries() == 1
+
+    # An older batch is waiting: the live write must land AFTER it (before the fix it wrote first).
+    assert agent._flush_messages_to_session_db([{"role": "assistant", "content": "live"}], []) is True
+    assert _lock_retry_queue.await_idle(10.0)
+
+    assert order == ["queued", "live"]
+    assert [m["content"] for m in db.get_messages_as_conversation(key)] == ["queued", "live"]
