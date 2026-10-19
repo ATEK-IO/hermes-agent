@@ -481,7 +481,13 @@ class SessionDB(
     # optimize); attempt-counted budgets destroyed turns on a healthy store. Transcript
     # writes (failure aborts the turn) get the long budget; observation-only activity
     # writes sit on the response-critical path and get a sub-second one.
-    _WRITE_PATIENCE_S, _TRANSCRIPT_WRITE_PATIENCE_S, _ACTIVITY_WRITE_PATIENCE_S = 20.0, 60.0, 0.5
+    # Budgets are sized from the measured tail, not from a guess: with 40 concurrent
+    # writers on the live 8.4 GB store (ATE-6724, 2026-10-19) the write-lock wait ran
+    # p95 4.5-13.2 s and max 44.1 s at wal_autocheckpoint=1000, and 114 s at 64, while a
+    # lone writer committed in 7-43 ms. A 60 s transcript budget sat below that tail, so
+    # 3.7% of heartbeat runs died with "session storage was busy" on a healthy store.
+    # Open/init (a sibling VACUUM or checkpoint) shares _WRITE_PATIENCE_S.
+    _WRITE_PATIENCE_S, _TRANSCRIPT_WRITE_PATIENCE_S, _ACTIVITY_WRITE_PATIENCE_S = 60.0, 180.0, 0.5
     # A live compression lock gets a short wait (compression publishes in seconds), but the lease
     # is a correctness boundary: a writer still locked out afterwards is refused.
     # Observation-only activity heartbeat/label writes (#76354 review S1): these run on (or adjacent to) the
