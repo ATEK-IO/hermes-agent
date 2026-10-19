@@ -330,3 +330,68 @@ def test_cli_close_builds_prompt_before_creating_first_session_row(tmp_path, mon
     assert [m["content"] for m in db.get_messages_as_conversation(session_id)] == [
         "first prompt"
     ]
+
+
+def test_cli_close_settles_the_queued_batch_before_taking_the_persist_lock(tmp_path, monkeypatch):
+    """M2 (ATE-6552): the interactive CLI close is an EXIT flush AND it holds the persist lock.
+
+    ``agent._session_persist_lock`` IS ``_persist_lock()`` — the same RLock the retry worker needs to land
+    a queued batch. So the close must settle this session's FIFO *before* it takes that lock. With a bare
+    ``queue_on_lock=False`` the settle runs under the lock, the worker can never land, and the batch is
+    still pending when the interpreter exits with the daemon thread. The queued rows must land first, be
+    written exactly once, and the queue must be empty when the close returns.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    import sqlite3
+    import time
+
+    import cli as cli_mod
+    from agent import session_persistence
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(session_persistence, "_LOCK_TURN_WAIT_S", 10.0)
+    session_persistence._lock_retry_queue.reset()
+    try:
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "cli-close-queued-batch"
+        db.create_session(session_id=session_id, source="cli")
+        agent = _real_agent(db, session_id, [])
+
+        writes: list = []
+        real_write = db.append_messages_batch
+        state = {"locked_calls": 2}  # 1 = the live turn-end write, 2 = the worker's first attempt
+
+        def _record(*args, **kwargs):
+            content = ((kwargs.get("messages") or [{}])[0]).get("content")
+            if state["locked_calls"]:
+                state["locked_calls"] -= 1
+                raise sqlite3.OperationalError("database is locked")
+            writes.append(content)
+            return real_write(*args, **kwargs)
+
+        db.append_messages_batch = _record
+
+        # TURN END with the write lock held: the batch parks on the retry queue, the reply is not lost.
+        agent._persist_session([{"role": "assistant", "content": "queued"}])
+        assert session_persistence.pending_lock_retries() == 1
+
+        goodbye = {"role": "assistant", "content": "goodbye"}
+        agent._session_messages = [goodbye]
+        cli = object.__new__(cli_mod.HermesCLI)
+        cli.conversation_history = []
+        cli.session_id = session_id
+        cli.agent = agent
+
+        started = time.monotonic()
+        cli._persist_active_session_before_close()
+        elapsed = time.monotonic() - started
+
+        assert session_persistence.pending_lock_retries() == 0, (
+            "the exit flush returned with the batch still parked on the daemon queue")
+        assert elapsed < 5.0
+        assert writes == ["queued", "goodbye"]
+        assert [m["content"] for m in db.get_messages_as_conversation(session_id)] == ["queued", "goodbye"]
+    finally:
+        session_persistence._lock_retry_queue.await_idle(5.0)
+        session_persistence._lock_retry_queue.reset()
