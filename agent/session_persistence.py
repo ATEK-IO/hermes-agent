@@ -704,15 +704,32 @@ class SessionPersistenceMixin:
         if platform_id is not None:  # load-bearing for restart drain-window recovery dedup (has_platform_message_id)
             msg["platform_message_id"] = platform_id
 
+    def _settle_transcript_fifo(self, timeout_s: Optional[float] = None) -> float:
+        """Settle this session's queued transcript batches; return the budget left afterwards.
+
+        Call this WITHOUT holding the persist lock: the retry worker needs that same lock to land the
+        batch being waited on, so a settle under it burns the whole timeout and the batch is still
+        pending.  An EXIT caller that holds a lock of its own around the flush (the CLI close path holds
+        ``_session_persist_lock``, which IS ``_persist_lock()``) settles here first, then calls
+        ``_persist_session(..., queue_on_lock=False, settle_timeout_s=<returned>)``: the settle cost
+        comes out of the SAME ``_LOCK_TURN_WAIT_S`` budget, never added on top of it.
+        """
+        budget = _LOCK_TURN_WAIT_S if timeout_s is None else max(0.0, timeout_s)
+        started = time.monotonic()
+        _lock_retry_queue.wait_settled(getattr(self, "session_id", None), budget)
+        return max(0.0, budget - (time.monotonic() - started))
+
     def _persist_session(self, messages: list[dict], conversation_history: list[dict] | None = None,
-                         queue_on_lock: bool = True):
+                         queue_on_lock: bool = True, settle_timeout_s: Optional[float] = None):
         """Save to SQLite on any exit path. Trailing empty-response scaffolding is dropped from
         the live list; the persist override is applied to the DB row only.
 
         ``queue_on_lock`` belongs to TURN-END callers only, whose reply already exists.  A SHUTDOWN / EXIT
-        flush (gateway finalize, session reaper, atexit) must pass ``False``: the retry worker is a daemon
-        thread, so a batch parked there at interpreter exit dies with the process — those callers wait the
-        lock out in-process (bounded at ``_LOCK_TURN_WAIT_S``) exactly as before the retry queue existed.
+        flush (gateway finalize, session reaper, CLI close, atexit) must pass ``False``: the retry worker is
+        a daemon thread, so a batch parked there at interpreter exit dies with the process — those callers
+        wait the lock out in-process (bounded at ``_LOCK_TURN_WAIT_S``) exactly as before the retry queue
+        existed.  A caller that already settled the FIFO outside a lock of its own (``_settle_transcript_fifo``)
+        passes the remaining budget as ``settle_timeout_s`` so this call does not open a second 60 s clock.
 
         The persist user-message *override* is NOT applied here — it is resolved inside
         ``_flush_messages_to_session_db`` and written only to the DB row, never mutating the live message
@@ -721,12 +738,16 @@ class SessionPersistenceMixin:
         from agent.agent_runtime_helpers import note_turn_persisted
         turn_wait_s = _LOCK_TURN_WAIT_S
         if not queue_on_lock:
-            # Settle this session's FIFO BEFORE taking the persist lock (the worker needs that lock).
-            # Whatever the settle costs comes out of the SAME 60 s an exit flush always had, so the
-            # shutdown path is never slower than the single busy-wait the queue replaced.
-            started = time.monotonic()
-            _lock_retry_queue.wait_settled(getattr(self, "session_id", None), turn_wait_s)
-            turn_wait_s = max(0.0, turn_wait_s - (time.monotonic() - started))
+            if settle_timeout_s is None:
+                # Settle this session's FIFO BEFORE taking the persist lock (the worker needs that lock).
+                # Whatever the settle costs comes out of the SAME 60 s an exit flush always had, so the
+                # shutdown path is never slower than the single busy-wait the queue replaced.
+                started = time.monotonic()
+                _lock_retry_queue.wait_settled(getattr(self, "session_id", None), turn_wait_s)
+                turn_wait_s = max(0.0, turn_wait_s - (time.monotonic() - started))
+            else:
+                # The caller already settled outside a lock of its own; only this much of the budget is left.
+                turn_wait_s = max(0.0, settle_timeout_s)
         with _persist_lock(self):
             # Only the scaffolding goes here. Closing a tool tail this uncovers is the exit
             # owner's job (``_close_transcript_tail``, ``abort_turn_on_interrupt``): only it knows

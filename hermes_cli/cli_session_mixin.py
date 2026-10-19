@@ -1020,7 +1020,7 @@ class CLISessionMixin:
 
         persist_lock = getattr(agent, "_session_persist_lock", None)
 
-        def _snapshot_and_persist() -> None:
+        def _snapshot_and_persist(settle_timeout_s=None) -> None:
             # Must share the staging lock with ``chat()``: otherwise close can retain a
             # history baseline just before chat appends its pending dict, and the later flush
             # stamps that dict durable without writing a row.
@@ -1065,7 +1065,12 @@ class CLISessionMixin:
                 return
 
             agent._ensure_db_session()
-            agent._persist_session(messages, conversation_history)
+            # EXIT flush: this caller finishes with ``end_session``, cleanup and the exit summary and then
+            # the interpreter dies, and the retry worker is a daemon thread — a batch parked there is lost.
+            # Wait it out in-process; ``settle_timeout_s`` is what is left of the single 60 s budget after
+            # the FIFO settle below (never a second clock).
+            agent._persist_session(messages, conversation_history, queue_on_lock=False,
+                                   settle_timeout_s=settle_timeout_s)
             if getattr(agent, "session_id", None):
                 self.session_id = agent.session_id
                 self._write_terminal_breadcrumb()
@@ -1080,11 +1085,21 @@ class CLISessionMixin:
             # persist itself runs LATER (after memory prefetch / pre_llm_call), so the row is written once
             # with its final api_content — both steps take the same per-agent persist lock as CLI close
             # persistence.
+            # The close path takes the persist lock below, and that is the SAME RLock the retry worker needs
+            # to land a queued batch (``agent.session_persistence._persist_lock``).  Settle this session's
+            # FIFO FIRST, outside the lock, and hand the remaining budget on: a settle under the lock stalls
+            # the worker for the whole timeout and the exit flush then writes anyway, out of order.
+            settle_timeout_s = None
+            settle = getattr(agent, "_settle_transcript_fifo", None)
+            if callable(settle):
+                remaining = settle()
+                if isinstance(remaining, (int, float)):
+                    settle_timeout_s = float(remaining)
             if persist_lock is None:
-                _snapshot_and_persist()
+                _snapshot_and_persist(settle_timeout_s)
             else:
                 with persist_lock:
-                    _snapshot_and_persist()
+                    _snapshot_and_persist(settle_timeout_s)
         except (Exception, KeyboardInterrupt) as e:
             logger.debug("Could not persist active CLI session before close: %s", e)
 
