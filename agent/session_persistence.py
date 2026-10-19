@@ -3,8 +3,12 @@ with intrinsic ``_DB_PERSISTED_MARKER`` dedup, ephemeral-scaffolding filtering, 
 trajectory export."""
 import hashlib
 
+import collections
 import logging
+import random
 import re
+import threading
+import time
 from contextlib import nullcontext
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -141,6 +145,196 @@ def _persist_lock(agent):
     """
     lock = getattr(agent, "_session_persist_lock", None)
     return nullcontext() if lock is None else lock
+
+
+# --- locked-write retry queue ---------------------------------------------------------------------
+# Measured 2026-10-19: one writer held the state.db write lock for >100 s, 16 turns expired their 60 s
+# transcript patience and 12 runs ended ``adapter_failed`` / "No reply: session storage was busy" —
+# although the model call had already completed and only the final persist was missing.  A lock is a
+# WAIT, not a loss: at TURN END the collected batch is parked here, the reply goes back to the adapter,
+# and the batch is retried with jitter until it lands.  The turn-end explanation is emitted only when
+# this queue gives up (full, retries exhausted, or a non-lock error) — never merely because the lock
+# was held.  The queue is bounded and drops the OLDEST batch with an error log when full, so a stalled
+# database cannot grow the process's memory.
+#
+# It is deliberately NOT used for the mid-turn pre-tool flush: that flush refuses to run tool side
+# effects from process-only state, so waiting there is the correct behaviour.
+_LOCK_RETRY_MAX_BATCHES = 32
+_LOCK_RETRY_BASE_DELAY_S = 0.25
+_LOCK_RETRY_MAX_DELAY_S = 3.0
+_LOCK_RETRY_MAX_ATTEMPTS = 40
+_LOCK_RETRY_MAX_AGE_S = 600.0
+# One attempt must be cheap: the queue owns the waiting, not the SQLite busy loop.  Kept short so many
+# attempts fit inside a caller's transcript patience window.
+_LOCK_RETRY_ATTEMPT_PATIENCE_S = 1.5
+# Mid-turn (pre-tool) flush: the row must exist before tools run, so the turn waits for it in-process
+# instead of dying.  The budget equals the single 60 s busy-wait it replaces — never worse wall clock.
+_LOCK_TURN_WAIT_S = 60.0
+
+
+def _lock_retry_delay(attempt: int) -> float:
+    """Exponential backoff with jitter: ~20 waiters must not retry in lockstep and re-lock each other."""
+    base = min(_LOCK_RETRY_BASE_DELAY_S * (1.7 ** max(0, attempt)), _LOCK_RETRY_MAX_DELAY_S)
+    return base * random.uniform(0.6, 1.4)
+
+
+def _emit_persistence_gave_up(agent, cause: str, detail: str) -> None:
+    """Name the failure only when the retry queue gives up — the one case a reply is still not durable."""
+    try:
+        agent._last_persistence_error_cause = cause or "locked"
+        logger.error("Transcript retry gave up for session %s: %s",
+                     getattr(agent, "session_id", None), detail)
+        formatter = getattr(agent, "_format_turn_completion_explanation", None)
+        explanation = formatter("session_persistence_failed", cause or "locked") if callable(formatter) else ""
+        printer = getattr(agent, "_safe_print", None)
+        if explanation and callable(printer):
+            printer(f"\n{explanation}\n")
+    except Exception:  # a give-up notice must never raise out of the retry thread
+        logger.debug("lock-retry give-up explanation failed", exc_info=True)
+
+
+class _LockRetryQueue:
+    """One FIFO of pending transcript batches, drained by a daemon thread.
+
+    FIFO keeps a session's rows in write order: once a batch for a session is waiting, later batches for
+    that session queue behind it instead of overtaking it.  Each attempt takes ``_persist_lock(agent)``,
+    so it never races the live flush of the same agent.
+    """
+
+    def __init__(self, max_batches: int = _LOCK_RETRY_MAX_BATCHES):
+        self._max = max_batches
+        self._entries: collections.deque = collections.deque()
+        self._cond = threading.Condition()
+        self._thread: Optional[threading.Thread] = None
+        self.dropped = 0
+
+    # -- producer side --------------------------------------------------------------------------
+    def has_pending(self, session_id: Optional[str]) -> bool:
+        with self._cond:
+            return any(entry["session_id"] == session_id for entry in self._entries)
+
+    def enqueue(self, agent, session_id: Optional[str], batch_rows: list[dict[str, Any]],
+                batch_msgs: list[dict[str, Any]]) -> bool:
+        """Park one batch for retry. Returns False only when the batch is empty (nothing to do)."""
+        if not batch_rows:
+            return False
+        dropped = None
+        with self._cond:
+            if len(self._entries) >= self._max:
+                dropped = self._entries.popleft()  # drop-oldest: the caller just finished a NEWER turn
+                self.dropped += 1
+            self._entries.append({
+                "agent": agent, "session_id": session_id,
+                "batch_rows": list(batch_rows), "batch_msgs": list(batch_msgs),
+                "attempts": 0, "enqueued_at": time.monotonic(),
+            })
+            self._ensure_worker_locked()
+            self._cond.notify()
+        if dropped is not None:
+            _emit_persistence_gave_up(
+                dropped["agent"], "locked",
+                f"retry queue full ({self._max} batches) — dropped the oldest batch "
+                f"({len(dropped['batch_rows'])} row(s), {dropped['attempts']} attempt(s))",
+            )
+        return True
+
+    def await_idle(self, timeout: float = 10.0) -> bool:
+        """Test/exit helper: True once nothing is pending (does not start the worker)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._cond:
+                if not self._entries:
+                    return True
+            time.sleep(0.01)
+        with self._cond:
+            return not self._entries
+
+    def reset(self) -> None:
+        """Test helper: forget pending batches and counters."""
+        with self._cond:
+            self._entries.clear()
+            self.dropped = 0
+
+    # -- worker side ----------------------------------------------------------------------------
+    def _ensure_worker_locked(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._drain, name="hermes-transcript-lock-retry",
+                                        daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        while True:
+            with self._cond:
+                while not self._entries:
+                    self._cond.wait()
+                entry = self._entries[0]
+            while True:
+                try:
+                    wait_s = self._attempt(entry)
+                except Exception:  # a poison entry must never wedge the queue behind it
+                    logger.error("Transcript retry entry for session %s failed unexpectedly; dropping it",
+                                 entry.get("session_id"), exc_info=True)
+                    wait_s = None
+                if wait_s is None:
+                    with self._cond:
+                        if self._entries and self._entries[0] is entry:
+                            self._entries.popleft()
+                        else:  # dropped by a full queue while we waited
+                            for i, other in enumerate(self._entries):
+                                if other is entry:
+                                    del self._entries[i]
+                                    break
+                    break
+                time.sleep(wait_s)
+
+    def _attempt(self, entry) -> Optional[float]:
+        """One write attempt. ``None`` = settle this entry (landed, empty or given up); float = wait."""
+        from hermes_state import classify_persistence_error
+
+        agent = entry["agent"]
+        try:
+            # Marker filter AND write under the agent's persist lock: the live flush collects its batch
+            # under the same lock, so exactly one of the two writes each dict (no duplicate on the race).
+            with _persist_lock(agent):
+                pending = [(row, msg) for row, msg in zip(entry["batch_rows"], entry["batch_msgs"])
+                           if not msg.get(_DB_PERSISTED_MARKER)]
+                if not pending:
+                    return None  # a live flush already landed these rows while this batch waited
+                entry["batch_rows"] = [row for row, _ in pending]
+                entry["batch_msgs"] = [msg for _, msg in pending]
+                _db_flush_write(agent, entry["batch_rows"], entry["batch_msgs"], [],
+                                patience_s=_LOCK_RETRY_ATTEMPT_PATIENCE_S)
+        except Exception as e:
+            entry["attempts"] += 1
+            try:
+                cause = classify_persistence_error(e)
+            except Exception:
+                cause = "unknown"
+            _age = time.monotonic() - entry["enqueued_at"]
+            if (cause == "locked" and entry["attempts"] < _LOCK_RETRY_MAX_ATTEMPTS
+                    and _age < _LOCK_RETRY_MAX_AGE_S):
+                logger.debug("Transcript retry %d for session %s still locked (%0.1fs): %s",
+                             entry["attempts"], entry["session_id"], _age, e)
+                return _lock_retry_delay(entry["attempts"])
+            _emit_persistence_gave_up(
+                agent, cause,
+                f"{cause} after {entry['attempts']} attempt(s) over {_age:0.1f}s "
+                f"({len(entry['batch_rows'])} row(s) not durable): {e}",
+            )
+            return None
+        logger.warning("Transcript batch for session %s landed after %d lock retry(ies) (%d row(s))",
+                       entry["session_id"], entry["attempts"], len(entry["batch_rows"]))
+        return None
+
+
+_lock_retry_queue = _LockRetryQueue()
+
+
+def pending_lock_retries() -> int:
+    """Pending batch count (diagnostics / tests)."""
+    with _lock_retry_queue._cond:
+        return len(_lock_retry_queue._entries)
 
 
 def adopt_unanswered_turn(history: list[dict[str, Any]], query: Any, agent: Any) -> bool:
@@ -287,7 +481,8 @@ def _db_flush_collect(agent, messages: list[dict], conversation_history: Optiona
     return batch_rows, batch_msgs
 
 
-def _db_flush_write(agent, batch_rows: list[dict[str, Any]], batch_msgs: list[dict], messages: list[dict]) -> None:
+def _db_flush_write(agent, batch_rows: list[dict[str, Any]], batch_msgs: list[dict], messages: list[dict],
+                    patience_s: Optional[float] = None) -> None:
     """One transaction for the turn's new rows: on failure nothing lands and no markers are stamped."""
     if not batch_rows:
         return
@@ -296,6 +491,7 @@ def _db_flush_write(agent, batch_rows: list[dict[str, Any]], batch_msgs: list[di
         compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
         turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
         turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+        patience_s=patience_s,
     )
     sync_flushed_message_markers(batch_msgs, batch_rows)
     if _newest_checkpoint_carrier(batch_msgs, "codex_reasoning_items") >= 0:
@@ -303,6 +499,36 @@ def _db_flush_write(agent, batch_rows: list[dict[str, Any]], batch_msgs: list[di
         # the live transcript so forks/compaction built from memory carry one checkpoint too. Markers stay:
         # the rows are durable exactly as the dicts now read.
         drop_shadowed_checkpoints(messages)
+
+
+def _db_flush_write_with_lock_wait(agent, batch_rows: list[dict[str, Any]], batch_msgs: list[dict],
+                                   messages: list[dict], wait_s: float) -> Optional[Exception]:
+    """Mid-turn flush that WAITS a held write lock out instead of turning it into a failed turn.
+
+    The pre-tool flush must land the row before tools run (tools never execute from process-only state),
+    so it cannot hand the batch to the retry queue — it waits here.  Each attempt is cheap and the total
+    is bounded by ``wait_s`` (equal to the single 60 s busy-wait this replaces), so a permanent lock still
+    fails closed in the same wall clock, with far more chances to land when the holder is short-lived.
+    """
+    from hermes_state import classify_persistence_error
+
+    deadline = time.monotonic() + max(0.0, wait_s)
+    attempt = 0
+    while True:
+        try:
+            _db_flush_write(agent, batch_rows, batch_msgs, messages,
+                            patience_s=_LOCK_RETRY_ATTEMPT_PATIENCE_S)
+            return None
+        except Exception as e:
+            remaining = deadline - time.monotonic()
+            try:
+                cause = classify_persistence_error(e)
+            except Exception:
+                cause = "unknown"
+            if cause != "locked" or remaining <= 0:
+                return e
+            attempt += 1
+            time.sleep(min(_lock_retry_delay(attempt), remaining))
 
 
 def _db_flush_adopt_compression_tip(agent) -> bool:
@@ -338,13 +564,15 @@ def _db_flush_session_row_gone(agent, session_id: Optional[str]) -> bool:
 
 
 def _db_flush_failed(agent, e: Exception, batch_rows: list[dict[str, Any]], adoption_budget: int,
-                     messages: list[dict]) -> Optional[str]:
+                     messages: list[dict], batch_msgs: Optional[list[dict[str, Any]]] = None,
+                     queue_on_lock: bool = False) -> Optional[str]:
     """Classify a failed flush and name the one retry the caller should take, or None to fail closed.
 
     ``"adopted"``: a compression-closed session moved onto its live tip. ``"healed"``: the session row was
     deleted under the live agent and has been recreated (unparented for a delegate child whose parent went
     with it); flush markers are reset so the caller replays the full in-memory transcript. Either retry is
-    taken at most once (``adoption_budget``)."""
+    taken at most once (``adoption_budget``). ``"queued"``: a write lock was held at TURN END and the batch
+    is now owned by the bounded retry queue — the caller returns the reply instead of failing the turn."""
     agent._db_flush_scan_prefix = None  # full re-scan next flush: an exception mid-loop leaves mixed dispositions
     # The only place the SQLite error is visible before it becomes a bare False — classify it so the turn-end
     # explanation names the real cause.
@@ -405,6 +633,15 @@ def _db_flush_failed(agent, e: Exception, batch_rows: list[dict[str, Any]], adop
         if adoption_budget > 0 and _db_flush_adopt_compression_tip(agent):
             return "adopted"
         agent._compression_adoption_failed = True  # lets the turn explanation name rotation, not full-disk advice
+    if agent._last_persistence_error_cause == "locked" and queue_on_lock and batch_rows:
+        # TURN END only. The reply already exists and only the persist is missing, so a held write lock is
+        # a WAIT and not a loss: park the batch, hand the reply back, and let the queue land it.
+        _lock_retry_queue.enqueue(agent, getattr(agent, "session_id", None), batch_rows,
+                                  batch_msgs if batch_msgs is not None else [])
+        logger.warning("Session DB is locked; queued %d row(s) for session %s and returned the turn "
+                       "(retry queue depth %d)", len(batch_rows), getattr(agent, "session_id", None),
+                       pending_lock_retries())
+        return "queued"
     logger.warning("Session DB append_message failed: %s", e)
     return None
 
@@ -447,7 +684,8 @@ class SessionPersistenceMixin:
             # the reason to record.
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
-            self._flush_messages_to_session_db(messages, conversation_history)
+            # TURN END: a locked write is a WAIT, not a lost reply — park the batch and let it land later.
+            self._flush_messages_to_session_db(messages, conversation_history, queue_on_lock=True)
             # Drain async token-accounting deltas at every persist point; cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
@@ -466,13 +704,20 @@ class SessionPersistenceMixin:
 
     _repair_message_sequence = _forward("agent.agent_runtime_helpers", "repair_message_sequence")
 
-    def _flush_messages_to_session_db(self, messages: list[dict], conversation_history: Optional[list[dict]] = None):
-        """Serialize direct and turn-boundary session flushes per agent."""
+    def _flush_messages_to_session_db(self, messages: list[dict], conversation_history: Optional[list[dict]] = None,
+                                      queue_on_lock: bool = False):
+        """Serialize direct and turn-boundary session flushes per agent.
+
+        ``queue_on_lock=True`` is for TURN-END callers (the reply already exists): a ``locked`` write parks
+        the batch on the bounded retry queue and reports success, so the turn returns its reply. Mid-turn
+        callers keep the default (fail closed) — they must not run side effects from process-only state."""
         with _persist_lock(self):
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+            return self._flush_messages_to_session_db_unlocked(messages, conversation_history,
+                                                              queue_on_lock=queue_on_lock)
 
     def _flush_messages_to_session_db_unlocked(
         self, messages: list[dict], conversation_history: Optional[list[dict]] = None, _adoption_budget: int = 1,
+        queue_on_lock: bool = False,
     ):
         """Persist un-flushed messages to SQLite. Dedup is the intrinsic ``_DB_PERSISTED_MARKER`` on each written
         dict — not positional slices (drift after sequence repair) nor an ``id(msg)`` set (address reuse). The
@@ -491,13 +736,27 @@ class SessionPersistenceMixin:
         if getattr(self, "_persist_disabled", False) or not self._session_db:
             return None
         batch_rows: list[dict[str, Any]] = []
+        batch_msgs: list[dict[str, Any]] = []
         try:
             if not self._session_db_created:  # retry row creation if the earlier attempt failed transiently
                 self._ensure_db_session()
             # getattr: object.__new__ test agents flush without running AIAgent init.
             replay = getattr(self, "_session_row_replay_pending", None) == self.session_id
             batch_rows, batch_msgs = _db_flush_collect(self, messages, conversation_history, replay)
-            _db_flush_write(self, batch_rows, batch_msgs, messages)
+            if queue_on_lock and batch_rows and _lock_retry_queue.has_pending(self.session_id):
+                # A batch for this session is already waiting for the lock: stay behind it (FIFO) instead of
+                # racing it and landing this turn's rows out of order.
+                _lock_retry_queue.enqueue(self, self.session_id, batch_rows, batch_msgs)
+                return True
+            if queue_on_lock:
+                _db_flush_write(self, batch_rows, batch_msgs, messages,
+                                patience_s=_LOCK_RETRY_ATTEMPT_PATIENCE_S)
+            else:
+                # Mid-turn: the row must exist before tools run — wait the lock out, bounded, then fail.
+                _wait_error = _db_flush_write_with_lock_wait(self, batch_rows, batch_msgs, messages,
+                                                             _LOCK_TURN_WAIT_S)
+                if _wait_error is not None:
+                    raise _wait_error
             self._session_row_replay_pending = None
             # Markers are now the sole truth; reset the one-shot seed so no id() outlives this flush.
             self._flushed_db_message_ids = set()
@@ -506,11 +765,15 @@ class SessionPersistenceMixin:
             self._db_flush_scan_prefix = messages[:]
             return True
         except Exception as e:
-            retry = _db_flush_failed(self, e, batch_rows, _adoption_budget, messages)
+            retry = _db_flush_failed(self, e, batch_rows, _adoption_budget, messages,
+                                     batch_msgs=batch_msgs, queue_on_lock=queue_on_lock)
             if retry is None:
                 return False
+            if retry == "queued":
+                return True
             # After a heal the pending replay re-sends the history prefix instead of stamping it durable.
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history, _adoption_budget=0)
+            return self._flush_messages_to_session_db_unlocked(messages, conversation_history, _adoption_budget=0,
+                                                              queue_on_lock=queue_on_lock)
 
     def _get_messages_up_to_last_assistant(self, messages: list[dict]) -> list[dict]:
         """Messages before the last assistant turn (rollback point for a malformed final answer); all if none."""
