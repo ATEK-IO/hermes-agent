@@ -745,10 +745,37 @@ def apply_subprocess_home_env(env: MutableMapping[str, str]) -> None:
 # own venv per campaign lane) sat for three days and filled the disk.
 SCRATCH_TMP_ENV_VARS = ("TMPDIR", "TMP", "TEMP")
 SCRATCH_DIR_MARKER_ENV = "HERMES_SCRATCH_DIR"
-SCRATCH_MAX_IDLE_HOURS = 24
+SCRATCH_MAX_IDLE_HOURS = 24.0
+# Deployment knob: how long an idle scratch entry is kept before the prune removes it. Read on
+# every prune rather than frozen at import, so a restarted process picks up a host change; an
+# unset, non-numeric or out-of-range value falls back/clamps instead of failing the boot.
+SCRATCH_MAX_IDLE_HOURS_ENV = "HERMES_SCRATCH_MAX_IDLE_HOURS"
+SCRATCH_MAX_IDLE_HOURS_MIN = 1.0
+SCRATCH_MAX_IDLE_HOURS_MAX = 168.0
 _SCRATCH_PRUNE_STAMP = ".last_prune"
 _SCRATCH_PRUNE_INTERVAL_SECONDS = 3600
 _scratch_pruned_once = False
+
+
+def scratch_max_idle_hours() -> float:
+    """Effective idle retention for scratch entries, in hours.
+
+    ``HERMES_SCRATCH_MAX_IDLE_HOURS`` (float) wins when it parses; the value is clamped to
+    ``[SCRATCH_MAX_IDLE_HOURS_MIN, SCRATCH_MAX_IDLE_HOURS_MAX]`` so a typo cannot keep a tree
+    forever or delete one on the next pass. Anything else (unset, empty, ``abc``, NaN) returns
+    the ``SCRATCH_MAX_IDLE_HOURS`` default.
+    """
+    raw = os.environ.get(SCRATCH_MAX_IDLE_HOURS_ENV, "").strip()
+    if not raw:
+        return SCRATCH_MAX_IDLE_HOURS
+    try:
+        hours = float(raw)
+    except (TypeError, ValueError):
+        return SCRATCH_MAX_IDLE_HOURS
+    if hours != hours:  # NaN: every comparison is false, and clamping would keep NaN
+        return SCRATCH_MAX_IDLE_HOURS
+    return min(max(hours, SCRATCH_MAX_IDLE_HOURS_MIN), SCRATCH_MAX_IDLE_HOURS_MAX)
+
 
 # AF_UNIX socket paths cap at 104 bytes (macOS) / 108 (Linux). Chrome appends
 # ``com.google.Chrome.XXXXXX/SingletonSocket`` (~45) and the code kernel
@@ -898,8 +925,9 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
 
     Every Hermes process and child gets ``TMPDIR``/``TMP``/``TEMP`` pointed here at boot (see
     :func:`export_scratch_tmp_env`), so ``tempfile`` defaults land here without call sites
-    knowing. Entries idle for ``SCRATCH_MAX_IDLE_HOURS`` are pruned at most once per process
-    and once per hour across processes (stamp file), so a fan-out of children stays cheap.
+    knowing. Entries idle for ``scratch_max_idle_hours()`` (``HERMES_SCRATCH_MAX_IDLE_HOURS``,
+    default ``SCRATCH_MAX_IDLE_HOURS``) are pruned at most once per process and once per hour
+    across processes (stamp file), so a fan-out of children stays cheap.
 
     Permissions follow :func:`apply_secure_dir_policy`, so an explicit ``HERMES_HOME_MODE`` or
     a managed/shared home is honored instead of a blanket ``0700`` (#117347).
@@ -919,16 +947,19 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
     return scratch
 
 
-def prune_scratch_dir(scratch: Path | None = None, max_idle_hours: float = SCRATCH_MAX_IDLE_HOURS) -> int:
+def prune_scratch_dir(scratch: Path | None = None, max_idle_hours: float | None = None) -> int:
     """Delete top-level scratch entries with no write anywhere in their subtree for
-    *max_idle_hours*, reaping processes and git worktree registrations rooted in them
-    first (``hermes_constants_scratch``); return the count removed. Each removal and kill is
-    recorded in ``<home>/logs/scratch-prune.log`` (*scratch* is ``<home>/cache/scratch``)."""
+    *max_idle_hours* (default: :func:`scratch_max_idle_hours`, i.e. the env knob), never one
+    that holds a live process; reaping git worktree registrations rooted in the removed ones
+    (``hermes_constants_scratch``); return the count removed. Each removal and each signalled
+    orphan is recorded in ``<home>/logs/scratch-prune.log`` (*scratch* is
+    ``<home>/cache/scratch``)."""
     from hermes_constants_scratch import prune_idle_entries
 
     root = scratch if scratch is not None else get_scratch_dir(prune=False)
+    hours = scratch_max_idle_hours() if max_idle_hours is None else max_idle_hours
     log_file = root.parent.parent / "logs" / "scratch-prune.log"
-    return prune_idle_entries(root, max_idle_hours, frozenset({_SCRATCH_PRUNE_STAMP}), log_file)
+    return prune_idle_entries(root, hours, frozenset({_SCRATCH_PRUNE_STAMP}), log_file)
 
 
 def _prune_scratch_dir_once(scratch: Path) -> None:
