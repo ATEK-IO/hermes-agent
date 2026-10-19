@@ -81,6 +81,18 @@ class TestTranscriptWritePatience:
         assert db._WRITE_PATIENCE_S >= 10.0
         assert db._TRANSCRIPT_WRITE_PATIENCE_S >= 30.0
 
+    def test_budgets_clear_the_measured_lock_wait_tail(self, db):
+        """ATE-6724 measured the write-lock wait on the live 8.4 GB store at fleet
+        concurrency (40 writers): p95 4.5-13.2 s, max 44.1 s at wal_autocheckpoint
+        1000, and 114 s at 64, against 7-43 ms for a lone writer. A 60 s transcript
+        budget sat inside that tail and 3.7% of heartbeat runs died on a healthy
+        store. Pin the budgets above the measured tail so shrinking them again has
+        to argue with the measurement (ATE-6800)."""
+        assert db._TRANSCRIPT_WRITE_PATIENCE_S >= 180.0
+        assert db._WRITE_PATIENCE_S >= 60.0
+        # Activity heartbeats stay sub-second: they sit on the response path.
+        assert db._ACTIVITY_WRITE_PATIENCE_S <= 1.0
+
     def test_exhausted_patience_names_the_real_cause(self, db, monkeypatch):
         """When patience genuinely runs out, the error must say the lock was
         held by another process — not read like disk/permission damage."""
