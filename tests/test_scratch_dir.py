@@ -227,51 +227,57 @@ def test_secure_file_skips_chmod_on_canonical_container_signal(tmp_path, monkeyp
     assert stat.S_IMODE(os.stat(f).st_mode) == 0o640
 
 
-def test_prune_reaps_process_living_in_idle_entry_and_spares_live_tree(tmp_path):
-    """A process whose cwd is inside an idle entry is gone by the time the entry is
-    (a lane's headless browsers survived for days with a deleted cwd); one living in a
-    tree that is still being written is not touched."""
+def test_prune_spares_process_living_in_idle_entry_and_removes_the_quiet_tree(tmp_path):
+    """ATE-7299: a live process pins its entry whatever the deadline says. Retention may not
+    kill a run that is alive but quiet (a card waiting on a human, a long build); the entry
+    behind it stays, and only the tree nothing is using is removed."""
     import subprocess
 
     scratch = get_scratch_dir(tmp_path, prune=False)
-    idle, live = scratch / "idle-lane" / "wt", scratch / "live-lane" / "wt"
-    idle.mkdir(parents=True)
+    quiet, live, unused = (
+        scratch / "quiet-lane" / "wt", scratch / "live-lane" / "wt", scratch / "unused-lane",
+    )
+    quiet.mkdir(parents=True)
     live.mkdir(parents=True)
+    unused.mkdir()
     ancient = time.time() - 30 * 3600
-    for path in (idle.parent, idle, live.parent, live):
+    for path in (quiet.parent, quiet, live.parent, live, unused):
         os.utime(path, (ancient, ancient))
     (live / "log").write_text("still writing", encoding="utf-8")
     sleeper = [sys.executable, "-c", "import time; time.sleep(60)"]
-    doomed = subprocess.Popen(sleeper, cwd=str(idle), stdin=subprocess.DEVNULL)
+    kept = subprocess.Popen(sleeper, cwd=str(quiet), stdin=subprocess.DEVNULL)
     spared = subprocess.Popen(sleeper, cwd=str(live), stdin=subprocess.DEVNULL)
     try:
         assert prune_scratch_dir(scratch) == 1
-        assert doomed.wait(timeout=10) is not None
+        assert kept.poll() is None
         assert spared.poll() is None
-        assert not idle.parent.exists() and live.exists()
+        assert quiet.parent.exists() and live.exists()
+        assert not unused.exists()
     finally:
-        for proc in (doomed, spared):
+        for proc in (kept, spared):
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=10)
+    log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+    assert "sent TERM" not in log
 
 
-def test_prune_records_removals_and_kills_in_scratch_prune_log(tmp_path: Path) -> None:
-    """Every removed entry and every signalled process leaves a line in
-    ``<home>/logs/scratch-prune.log``: the prune's own handler writes it, so the boot-time
-    prune (before ``setup_logging()``) is not silent. An entry rmtree could not delete is
-    neither counted nor recorded as removed (#132401)."""
+def test_prune_records_removals_and_spares_a_busy_entry_in_the_log(tmp_path: Path) -> None:
+    """Every removed entry leaves a line in ``<home>/logs/scratch-prune.log``: the prune's own
+    handler writes it, so the boot-time prune (before ``setup_logging()``) is not silent. An
+    entry rmtree could not delete is neither counted nor recorded as removed (#132401), and an
+    entry that holds a live process is neither removed nor signalled (ATE-7299)."""
     import subprocess
 
     scratch = get_scratch_dir(tmp_path, prune=False)
-    gone, stuck = scratch / "idle-lane", scratch / "stuck-lane"
+    gone, stuck, busy = scratch / "idle-lane", scratch / "stuck-lane", scratch / "busy-lane"
     ancient = time.time() - 30 * 3600
-    for entry in (gone, stuck):
+    for entry in (gone, stuck, busy):
         entry.mkdir()
         (entry / "out.md").write_text("deliverable", encoding="utf-8")
         for path in (entry / "out.md", entry):
             os.utime(path, (ancient, ancient))
-    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=str(gone),
+    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=str(busy),
                               stdin=subprocess.DEVNULL)
     real_rmtree = shutil.rmtree
 
@@ -282,14 +288,14 @@ def test_prune_records_removals_and_kills_in_scratch_prune_log(tmp_path: Path) -
     try:
         with patch("hermes_constants_scratch.shutil.rmtree", rmtree):
             assert prune_scratch_dir(scratch) == 1
-        assert worker.wait(timeout=10) is not None
+        assert worker.poll() is None
     finally:
         if worker.poll() is None:
             worker.kill()
             worker.wait(timeout=10)
     log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
     assert f"removed {str(gone)!r} (" in log
-    assert f"sent TERM pid={worker.pid} " in log
+    assert "sent TERM" not in log
     assert f"could not fully remove {str(stuck)!r}" in log and f"removed {str(stuck)!r}" not in log
 
 

@@ -143,6 +143,44 @@ def _own_lineage() -> set[int]:
     return pids
 
 
+def busy_entries(scratch_root: Path) -> set[Path]:
+    """Top-level entries of *scratch_root* that hold a live same-user process.
+
+    "Holds" means the process's cwd is inside the entry — the same signal, and the same uid
+    filter, as :func:`reap_processes_rooted_in`. A process that merely has a file open inside an
+    entry (an editor, a log tail) does not pin the tree. A deleted cwd is not a live entry: those
+    orphans stay the reap's business. Returned paths are real paths.
+    """
+    import psutil
+
+    root = os.path.realpath(str(scratch_root))
+    skip = _own_lineage()
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    busy: set[Path] = set()
+    for proc in psutil.process_iter(["pid"]):
+        if proc.pid in skip:
+            continue
+        try:
+            if uid is not None and proc.uids().real != uid:
+                continue
+            cwd = proc.cwd()
+            if not cwd or cwd.endswith(" (deleted)"):
+                continue
+            cwd_path = os.path.realpath(cwd)
+        except Exception:
+            # Gone, access-denied, or a host-level guard on process inspection: we do not guess
+            # at a cwd we cannot read. The same scan feeds the reap, so an unreadable process is
+            # never signalled either.
+            continue
+        if not _under(cwd_path, root):
+            continue
+        relative = os.path.relpath(cwd_path, root)
+        if relative == os.curdir:
+            continue
+        busy.add(Path(root) / relative.split(os.sep, 1)[0])
+    return busy
+
+
 def reap_processes_rooted_in(scratch_root: Path, doomed: list[Path], audit: logging.Logger = logger) -> int:
     """TERM (then KILL) same-user processes whose cwd is inside an entry about to be
     pruned, or is a path under *scratch_root* that no longer exists. Returns the count.
@@ -244,9 +282,9 @@ def prune_idle_entries(
     root: Path, max_idle_hours: float, skip_names: frozenset[str], log_file: Path | None = None,
 ) -> int:
     """Delete top-level entries of *root* with no write anywhere in their subtree for
-    *max_idle_hours*, reaping processes and worktree registrations rooted in them first.
-    Each removal and each signalled process is recorded in *log_file*. Returns the count
-    actually removed."""
+    *max_idle_hours*, never one that holds a live process; reaping git worktree registrations
+    rooted in the removed ones first. Each removal and each signalled orphan is recorded in
+    *log_file*. Returns the count actually removed."""
     audit = _open_prune_log(log_file)
     try:
         return _prune_idle_entries(root, max_idle_hours, skip_names, audit)
@@ -264,12 +302,24 @@ def _prune_idle_entries(
         entries = [e for e in root.iterdir() if e.name not in skip_names]
     except OSError:
         return 0
-    doomed = [e for e in entries if not subtree_touched_since(e, cutoff)]
+    # The live-process guard is not optional: an entry with a same-user process rooted in it is
+    # never doomed, so the reap below can only ever signal an orphan whose cwd is already gone.
+    # Without psutil there is no guard, and deleting could kill a live run — skip this pass
+    # instead (the next one is an hour away) and say so.
+    try:
+        busy = {os.path.realpath(str(e)) for e in busy_entries(root)}
+    except Exception as exc:
+        logger.warning("scratch prune: live-process guard unavailable, keeping all entries: %s", exc)
+        return 0
+    doomed = [
+        e for e in entries
+        if os.path.realpath(str(e)) not in busy and not subtree_touched_since(e, cutoff)
+    ]
     # Runs even with nothing to delete: orphans whose cwd was removed by an earlier pass
     # (or by hand) are found by the deleted-cwd rule, not by membership in ``doomed``.
     try:
         reap_processes_rooted_in(root, doomed, audit)
-    except Exception as exc:  # psutil missing or restricted host: the deletion still proceeds
+    except Exception as exc:  # psutil went away between the two scans: the deletion still proceeds
         logger.debug("scratch prune: process reap skipped: %s", exc, exc_info=True)
     if not doomed:
         return 0
