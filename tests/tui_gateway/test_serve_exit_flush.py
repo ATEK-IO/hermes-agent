@@ -35,7 +35,7 @@ class _FlushAgent:
             else [{"role": "user", "content": "unflushed turn"}]
         )
 
-    def _persist_session(self, messages, conversation_history=None):
+    def _persist_session(self, messages, conversation_history=None, **kwargs):
         self.flush_calls.append(list(messages))
 
 @pytest.fixture
@@ -76,7 +76,7 @@ def test_sigterm_flushes_populated_session_into_state_db(
     db.create_session(sid, source="tui")
 
     class _DbAgent(_FlushAgent):
-        def _persist_session(self, messages, conversation_history=None):
+        def _persist_session(self, messages, conversation_history=None, **kwargs):
             super()._persist_session(messages, conversation_history)
             for msg in messages:
                 if msg.get("_db_persisted"):
@@ -135,7 +135,7 @@ def test_exit_flush_is_bounded(registered_session):
     """A hung persist must never block exit longer than the budget."""
 
     class _HangingAgent(_FlushAgent):
-        def _persist_session(self, messages, conversation_history=None):
+        def _persist_session(self, messages, conversation_history=None, **kwargs):
             time.sleep(5.0)
 
     registered_session("sess-hang", _HangingAgent())
