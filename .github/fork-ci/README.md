@@ -23,11 +23,13 @@ both `Run tests` slices and the Windows job ended `cancelled`, never started.
 Standard `ubuntu-latest` runners only.
 
 Known leftover: in 35 runs on this fork, no job with a `*-32-core` label has ever
-completed — 7 cancelled, 17 skipped, 2 queued, 0 started. So whenever an upstream
-workflow decides that lane applies (for example `nix flake check` on any
-`.github/**` change), that check sits `queued` and the commit status stays
-`pending` forever. Cancel that run; it will not start. It is not evidence of
-anything, passing or failing.
+executed a step. 17 were skipped by their `if:`; the 7 that reached `cancelled`
+carry 0 steps each — on the only full `ci.yaml` run (38944034361) both `Run
+tests` slices sat exactly 24h and were cancelled with 0 steps, which is the
+queue timeout, not a result. So whenever an upstream workflow decides that lane
+applies (for example `nix flake check` on any `.github/**` change), that check
+sits `queued` and the commit status stays `pending`. Cancel that run; it will not
+start. It is not evidence of anything, passing or failing.
 
 | job | what it does |
 |---|---|
