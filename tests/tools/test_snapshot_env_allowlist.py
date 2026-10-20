@@ -59,8 +59,12 @@ def test_allowlist_has_no_credential_shaped_name():
         r"(^|_)(TOKEN|TOKENS|SECRET|SECRETS|PASS|PASSWD|PASSWORD|PASSWORDS|PASSPHRASE|PWD|"
         r"KEY|KEYS|APIKEY|CREDENTIAL|CREDENTIALS|AUTH|PRIVATE|COOKIE|SESSION_KEY)(_|$)"
     )
+    # Paths, not passwords. PWD/OLDPWD are the shell's own directories; SSH_AUTH_SOCK is the
+    # ssh-agent socket path (ATE-7783) - it lives in the EXACT arm precisely because its name
+    # trips this shape and the exact arm applies no shape test, so nothing else is carved out.
+    path_shaped = {"PWD", "OLDPWD", "SSH_AUTH_SOCK"}
     for name in SNAPSHOT_ENV_ALLOW:
-        if name in {"PWD", "OLDPWD"}:
+        if name in path_shaped:
             continue
         assert not credential.search(name), f"{name} reads as a credential and must not persist"
 
@@ -89,6 +93,31 @@ def test_only_allowlisted_names_reach_the_snapshot():
     assert "declare -x XDG_DATA_HOME=" in out
     for leaked in ("GITLAB_TOKEN", "AWS_SECRET_ACCESS_KEY", "MY_APP_FLAG", "GOPATH", "XDG_TOKEN"):
         assert leaked not in out, f"{leaked} must not persist into the snapshot"
+
+
+def test_consumer_names_are_emitted_and_credential_family_is_not():
+    """ATE-7783 / M1: the subset check cannot see an OMISSION, only a surplus.
+
+    A real ``export -p`` on T15 measured 124 lines; the merged emitter kept 27. The three
+    families below are what every later command in a resumed session needs: the board URL,
+    the ssh-agent socket for a push, and the terminal tool's own settings.
+    """
+    out = _dump(
+        {
+            "HOME": "/root",
+            "PAPERCLIP_API_URL": "http://paperclip.atek.io:3100/api",
+            "PAPERCLIP_RUN_ID": "run-1",
+            "SSH_AUTH_SOCK": "/run/user/1000/ssh-agent.socket",
+            "TERMINAL_PERSISTENT_SHELL": "/bin/bash",
+            # Credential-shaped members of the same families must still be dropped.
+            "PAPERCLIP_API_KEY": "not-a-real-key",
+            "TERMINAL_SESSION_KEY": "not-a-real-key",
+        }
+    )
+    for present in ("PAPERCLIP_API_URL", "PAPERCLIP_RUN_ID", "SSH_AUTH_SOCK", "TERMINAL_PERSISTENT_SHELL"):
+        assert f"declare -x {present}=" in out, f"{present} is needed by a resumed session"
+    for absent in ("PAPERCLIP_API_KEY", "TERMINAL_SESSION_KEY", "not-a-real-key"):
+        assert absent not in out, f"{absent} must not persist into the snapshot"
 
 
 def test_unexported_shell_variable_is_not_dumped():

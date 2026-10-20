@@ -59,13 +59,21 @@ SNAPSHOT_ENV_ALLOW = frozenset({
     "COLUMNS", "LINES", "HERMES_HOME", "HERMES_REAL_HOME", "HERMES_INTERACTIVE",
     "HERMES_QUIET", "HERMES_YOLO_MODE", "HERMES_SINGLE_QUERY_SESSION",
     "HERMES_LESSONS_PATH", "HERMES_KANBAN_BOARD", "HERMES_UI_SESSION_ID",
+    # SSH agent socket PATH, not a secret: the key behind it never enters the environment,
+    # and a resumed session needs it for `git push` over ssh. It goes in the EXACT set on
+    # purpose - the prefix arm applies SNAPSHOT_CREDENTIAL_NAME, which matches `AUTH`, while
+    # the exact arm does not, so this admits it without a credential-shaped carve-out.
+    "SSH_AUTH_SOCK",
 })
 
 # Per-host / per-locale families. The fleet list also allows HERMES_SESSION_* and
 # HERMES_CRON_*; they are deliberately NOT re-allowed here because this runtime unsets
 # every one of those names before the dump (#90782, #71296) - allowing the family would
 # resurrect exactly what that unset removes.
-SNAPSHOT_ENV_ALLOW_PREFIXES = ("LC_", "XDG_")
+# PAPERCLIP_* carries the board URL every command needs; TERMINAL_* carries the terminal
+# tool's own settings. Both stay in the PREFIX arm, so the shape test still drops
+# PAPERCLIP_API_KEY and any other credential-shaped member of the family.
+SNAPSHOT_ENV_ALLOW_PREFIXES = ("LC_", "XDG_", "PAPERCLIP_", "TERMINAL_")
 
 # A prefix-allowed name that still reads as a credential is dropped. `PWD`/`OLDPWD` are
 # paths, not passwords, and are matched by the exact list above, not by this shape.
