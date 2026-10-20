@@ -23,6 +23,7 @@ import pytest
 from tools.environments.base_session_env import (
     SNAPSHOT_ENV_ALLOW,
     SNAPSHOT_ENV_ALLOW_PREFIXES,
+    _SNAPSHOT_EXCLUDED_ENV_REGEX,
     _export_dump_excluding_session_vars,
     _snapshot_allowlist_emitter,
 )
@@ -114,9 +115,11 @@ def test_consumer_names_are_emitted_and_credential_family_is_not():
             "TERMINAL_SESSION_KEY": "not-a-real-key",
         }
     )
-    for present in ("PAPERCLIP_API_URL", "PAPERCLIP_RUN_ID", "SSH_AUTH_SOCK", "TERMINAL_PERSISTENT_SHELL"):
+    for present in ("PAPERCLIP_API_URL", "SSH_AUTH_SOCK", "TERMINAL_PERSISTENT_SHELL"):
         assert f"declare -x {present}=" in out, f"{present} is needed by a resumed session"
-    for absent in ("PAPERCLIP_API_KEY", "TERMINAL_SESSION_KEY", "not-a-real-key"):
+    # F1 on PR #9: per-run identity is NOT a consumer name — a later run must never
+    # inherit the run that happened to write the snapshot.
+    for absent in ("PAPERCLIP_RUN_ID", "PAPERCLIP_API_KEY", "TERMINAL_SESSION_KEY", "not-a-real-key"):
         assert absent not in out, f"{absent} must not persist into the snapshot"
 
 
@@ -180,3 +183,66 @@ def test_runtime_allowlist_is_a_subset_of_the_fleet_rule():
     )
     for prefix in SNAPSHOT_ENV_ALLOW_PREFIXES:
         assert prefix in fleet_prefixes, f"runtime prefix {prefix} is not in the fleet rule"
+
+
+# ---------------------------------------------------------------------------
+# F1 (PR #9 review): the PAPERCLIP_ prefix arm must not persist per-run identity.
+# ---------------------------------------------------------------------------
+
+def test_per_run_identity_names_are_in_the_exclusion_contract():
+    """Python-side contract: the three identity names are excluded by name, not by value."""
+    contract = re.compile(_SNAPSHOT_EXCLUDED_ENV_REGEX)
+    for name in ("PAPERCLIP_RUN_ID", "PAPERCLIP_TASK_ID", "PAPERCLIP_WAKE_REASON"):
+        assert contract.match(f"declare -x {name}='x'"), f"{name} must be excluded by name"
+    # The non-identity member of the family stays in the allow-list path.
+    assert not contract.match("declare -x PAPERCLIP_API_URL='http://x'")
+
+
+def test_snapshot_written_by_run_a_does_not_clobber_run_b_identity():
+    """F1 reproduction: snapshot from run A sourced in run B's shell.
+
+    Before the fix the snapshot carried ``PAPERCLIP_RUN_ID='run-A'``; sourcing it in a
+    command whose process env already said ``run-B`` overwrote the fresher value with the
+    foreign run's identity. The snapshot must carry the board URL and no identity at all,
+    so ``source`` leaves the per-command value intact.
+    """
+    snapshot = _dump(
+        {
+            "PAPERCLIP_API_URL": "http://paperclip.atek.io:3100/api",
+            "PAPERCLIP_RUN_ID": "run-A",
+            "PAPERCLIP_TASK_ID": "task-A",
+            "PAPERCLIP_WAKE_REASON": "heartbeat-A",
+        }
+    )
+    for name in ("PAPERCLIP_RUN_ID", "PAPERCLIP_TASK_ID", "PAPERCLIP_WAKE_REASON"):
+        assert f"declare -x {name}=" not in snapshot, f"{name} from the writing run leaked into the snapshot"
+    assert "declare -x PAPERCLIP_API_URL=" in snapshot
+
+    with tempfile.TemporaryDirectory() as tmp:
+        snap_path = os.path.join(tmp, "snap.sh")
+        Path(snap_path).write_text(snapshot, encoding="utf-8")
+        probe = (
+            f'source "{snap_path}" >/dev/null 2>&1; '
+            'printf "%s\\n" "$PAPERCLIP_RUN_ID" "$PAPERCLIP_TASK_ID" '
+            '"$PAPERCLIP_WAKE_REASON" "$PAPERCLIP_API_URL"'
+        )
+        proc = subprocess.run(
+            ["bash", "-c", probe],
+            env={
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "PAPERCLIP_RUN_ID": "run-B",
+                "PAPERCLIP_TASK_ID": "task-B",
+                "PAPERCLIP_WAKE_REASON": "heartbeat-B",
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+    lines = proc.stdout.splitlines()
+    assert lines[0] == "run-B", f"snapshot clobbered the live run id with {lines[0]!r}"
+    assert lines[1] == "task-B", f"snapshot clobbered the live task id with {lines[1]!r}"
+    assert lines[2] == "heartbeat-B", f"snapshot clobbered the live wake reason with {lines[2]!r}"
+    assert lines[3] == "http://paperclip.atek.io:3100/api", "board URL must still arrive from the snapshot"
+

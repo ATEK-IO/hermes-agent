@@ -29,7 +29,7 @@ from typing import Iterable
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
     "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|HERMES_DELEGATED_CHILD_CONTEXT|"
-    "HERMES_RPC_|HERMES_KERNEL_DIR)")
+    "HERMES_RPC_|HERMES_KERNEL_DIR|PAPERCLIP_RUN_ID|PAPERCLIP_TASK_ID|PAPERCLIP_WAKE_REASON)")
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # mktemp template suffix + the shell variable holding the allocated temp path.
@@ -74,6 +74,18 @@ SNAPSHOT_ENV_ALLOW = frozenset({
 # tool's own settings. Both stay in the PREFIX arm, so the shape test still drops
 # PAPERCLIP_API_KEY and any other credential-shaped member of the family.
 SNAPSHOT_ENV_ALLOW_PREFIXES = ("LC_", "XDG_", "PAPERCLIP_", "TERMINAL_")
+
+# Per-RUN identity the board bridges onto every command's process env. Same reason
+# HERMES_SESSION_* is excluded above: a snapshot written by run A and sourced by run B
+# would re-assert run A's identity over the fresher per-command value (F1 on PR #9,
+# reproduced with PAPERCLIP_RUN_ID=run-A in the snapshot and =run-B in the command env).
+# They are unset BEFORE the dump, so the PAPERCLIP_ prefix arm keeps carrying
+# PAPERCLIP_API_URL (and any future non-identity member) while dropping these three.
+SNAPSHOT_EXCLUDED_RUN_IDENTITY = (
+    "PAPERCLIP_RUN_ID",
+    "PAPERCLIP_TASK_ID",
+    "PAPERCLIP_WAKE_REASON",
+)
 
 # A prefix-allowed name that still reads as a credential is dropped. `PWD`/`OLDPWD` are
 # paths, not passwords, and are matched by the exact list above, not by this shape.
@@ -147,7 +159,7 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # leaked token in the snapshot would re-export into every later command
         # on the backend and outlive the private dir it protects.
         "${!HERMES_RPC_*} HERMES_KERNEL_DIR "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        f"HERMES_UI_SESSION_ID {' '.join(SNAPSHOT_EXCLUDED_RUN_IDENTITY)}{extra_unset} 2>/dev/null; "
         + _snapshot_allowlist_emitter()
         + ") || true; } "
         f"> {tmp_path}")
