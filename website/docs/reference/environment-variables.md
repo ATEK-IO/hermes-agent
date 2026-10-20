@@ -918,6 +918,20 @@ Terminal session snapshots do not persist injected session/agent attribution
 variables. Hermes supplies the current values for each command; an export
 inside a previous terminal command does not redefine the next session identity.
 
+## Scratch directory
+
+Every Hermes process gets a scratch space at `<HERMES_HOME>/cache/scratch`, and its
+`TMPDIR`/`TMP`/`TEMP` are pointed there at boot, so `tempfile` call sites and the processes
+Hermes spawns write to real storage instead of the system temp directory. Top-level entries are
+pruned once per process and at most once an hour across processes; each removal, and each
+process signalled for holding an entry open, is logged to `<HERMES_HOME>/logs/scratch-prune.log`.
+
+| Variable | Description |
+|----------|-------------|
+| `HERMES_SCRATCH_MAX_IDLE_HOURS` | How long a top-level scratch entry survives with no write anywhere in its subtree, in hours (float, default: `24`). Read at every prune, so a change applies to the next prune without a restart. Values are clamped to `1`–`168`; an unset, empty, non-numeric or `NaN` value uses the default. An entry that still holds a live process is never pruned, however idle it looks. |
+| `TMPDIR` / `TMP` / `TEMP` | Pointed at the scratch dir by Hermes. A value you set yourself is respected and left alone, which opts that process tree out of the scratch redirect. |
+| `HERMES_SCRATCH_DIR` | **Set by Hermes, not by you.** Records the scratch dir Hermes exported into a child process; the child compares `TMPDIR` against it to decide whether to re-derive the value for its own home. |
+
 ## Context Compression (config.yaml only)
 
 Context compression is configured exclusively through `config.yaml` — there are no environment variables for it. Threshold settings live in the `compression:` block, while the summarization model/provider lives under `auxiliary.compression:`.
