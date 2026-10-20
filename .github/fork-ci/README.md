@@ -10,7 +10,7 @@ cannot run on it. Before this workflow existed, a PR on this fork could show
 |---|---|---|
 | `ci.yaml` (orchestrator: 24 jobs — tests, lint, js-tests, rust, e2e) | `disabled_manually` | never runs |
 | `docker.yml` | active | `build` requires `github.repository == 'NousResearch/hermes-agent'`; every real job is `skipped`, the run concludes `success` |
-| `nix.yml` | active | classifier runs; `nix flake check` correctly skips a Python-only diff |
+| `nix.yml` | active | classifier runs; `nix flake check` correctly skips a Python-only diff, but **queues forever** when the classifier says the flake is affected (any `.github/**` change does) |
 
 `ci.yaml` cannot simply be re-enabled: its Python, JS, Rust and desktop lanes run
 on `ubuntu-latest-32-core` / `windows-latest-32-core`, GitHub *larger-runner*
@@ -20,7 +20,14 @@ both `Run tests` slices and the Windows job ended `cancelled`, never started.
 
 ## What `Fork CI` (`fork-ci.yml`) runs
 
-Standard `ubuntu-latest` runners only:
+Standard `ubuntu-latest` runners only.
+
+Known leftover: in 35 runs on this fork, no job with a `*-32-core` label has ever
+completed — 7 cancelled, 17 skipped, 2 queued, 0 started. So whenever an upstream
+workflow decides that lane applies (for example `nix flake check` on any
+`.github/**` change), that check sits `queued` and the commit status stays
+`pending` forever. Cancel that run; it will not start. It is not evidence of
+anything, passing or failing.
 
 | job | what it does |
 |---|---|
