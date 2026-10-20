@@ -1,0 +1,222 @@
+name: Fork CI
+
+# ─────────────────────────────────────────────────────────────────────────────
+# This repository is the ATEK-IO fork of NousResearch/hermes-agent. Upstream's
+# `.github/workflows/ci.yaml` orchestrator is DISABLED on this fork
+# (state: disabled_manually) and cannot simply be re-enabled:
+#
+#   * its Python/JS/Rust/desktop lanes run on `ubuntu-latest-32-core`, a
+#     GitHub *larger runner* label that does not exist on this account (no
+#     self-hosted runners, no paid larger runners) — those jobs would queue
+#     forever, not run;
+#   * `docker.yml` gates build+test on `github.repository ==
+#     'NousResearch/hermes-agent'`, which is never true here, so it reports
+#     `success` with every real job `skipped`;
+#   * `nix.yml` correctly skips `nix flake check` for a diff that touches no
+#     flake input — a legitimate skip that still reads as green.
+#
+# Net effect before this file: a PR on this fork could show "2 checks, both
+# green" while zero test code executed. That is what this workflow replaces.
+#
+# What runs here, on standard `ubuntu-latest` only:
+#   1. scope        — classify the diff; select the tests the diff can affect.
+#   2. python-tests — actually execute those test files via scripts/run_tests.sh.
+#   3. lint         — upstream's own blocking lint/ratchet lane (all
+#                     ubuntu-latest), called unmodified.
+#   4. NOT TESTED   — FAILS when the diff touches a surface this fork cannot
+#                     execute (desktop/frontend, nix, docker, packaging, rust).
+#                     It never goes green by accident: an untestable surface is
+#                     reported as untested, never as passed.
+#   5. fork-gate    — the one check to cite.
+#
+# This file is additive on purpose. It does not edit any upstream workflow, so
+# it never conflicts when the fork merges upstream again.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: fork-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  scope:
+    name: Scope (select affected tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tests: ${{ steps.sel.outputs.tests }}
+      count: ${{ steps.sel.outputs.count }}
+      untested: ${{ steps.sel.outputs.untested }}
+      summary: ${{ steps.sel.outputs.summary }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          # The diff is taken against the merge base, which needs the history
+          # of both sides.
+          fetch-depth: 0
+
+      - name: Select the tests this diff can affect
+        id: sel
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: python3 .github/fork-ci/select_tests.py
+
+      - name: Write the scope summary
+        run: |
+          set -euo pipefail
+          {
+            echo "### Fork CI scope"
+            echo
+            echo '```'
+            echo "${{ steps.sel.outputs.summary }}"
+            echo '```'
+            echo
+            if [ -n "${{ steps.sel.outputs.untested }}" ]; then
+              echo "**NOT TESTED on this fork:** ${{ steps.sel.outputs.untested }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  python-tests:
+    name: Python tests (affected)
+    needs: scope
+    # An empty selection means the diff touches no test-bearing code.
+    if: needs.scope.outputs.tests != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+
+      # Same runner input as upstream's lane: several suites shell out to rg.
+      - name: Install ripgrep (prebuilt binary)
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version
+
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+          prune-python-cache: true
+
+      - name: Check SQLite runs WAL
+        # Same guard as upstream: a PM-pinned interpreter with the WAL-reset
+        # bug silently degrades every WAL test.
+        run: |
+          "$HERMES_PYTHON" -c "import sqlite3, sys, hermes_state_wal as w; v = w.is_sqlite_wal_reset_vulnerable(); print(f'Python {sys.version.split()[0]}, SQLite {sqlite3.sqlite_version}, WAL-reset vulnerable: {v}'); sys.exit(1 if v else 0)"
+
+      - name: Run the selected tests
+        env:
+          HERMES_TEST_WORKERS: 4
+          HERMES_TEST_FILE_TIMEOUT: 600
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set -euo pipefail
+          echo "Selected ${{ needs.scope.outputs.count }} test file(s):"
+          echo "${{ needs.scope.outputs.tests }}" | tr ' ' '\n'
+          # shellcheck disable=SC2086
+          scripts/run_tests.sh ${{ needs.scope.outputs.tests }} -j 4
+
+  lint:
+    name: Lint (ruff + ty)
+    needs: scope
+    uses: ./.github/workflows/lint.yml
+    with:
+      event_name: ${{ github.event_name }}
+      python: true
+
+  untested:
+    name: "NOT TESTED: surface this fork cannot run"
+    needs: scope
+    if: needs.scope.outputs.untested != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Report the untested surface and fail
+        run: |
+          cat <<'MSG'
+          This diff touches a surface that the ATEK-IO fork cannot execute in CI:
+
+          ${{ needs.scope.outputs.untested }}
+
+          This job fails on purpose. It does not mean the code is broken. It
+          means no executed check exists for this part of the diff, so a green
+          "CI passed" line would be hollow.
+
+          What the author must do instead: run the affected check locally at the
+          exact head SHA and paste the command and its result into the pull
+          request description, then say which surfaces remain unverified. A
+          reviewer cites that local run — not this workflow — for those files.
+
+          Upstream lanes that would cover these surfaces exist but cannot run
+          here: their jobs require the `ubuntu-latest-32-core` larger-runner
+          label (not available on this account) and, for Docker, a
+          `github.repository == 'NousResearch/hermes-agent'` gate.
+          MSG
+          exit 1
+
+  fork-gate:
+    name: Fork CI gate
+    needs: [scope, python-tests, lint, untested]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate the lanes
+        run: |
+          set -euo pipefail
+          scope='${{ needs.scope.result }}'
+          tests='${{ needs.python-tests.result }}'
+          lint='${{ needs.lint.result }}'
+          untested='${{ needs.untested.result }}'
+
+          {
+            echo "### Fork CI gate"
+            echo
+            echo "| lane | result |"
+            echo "|---|---|"
+            echo "| scope | ${scope} |"
+            echo "| python tests | ${tests} |"
+            echo "| lint | ${lint} |"
+            echo "| untested surface | ${untested} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          rc=0
+          # A skipped lane means "nothing to do for this diff", which is not a
+          # pass of the work — the scope job records why.
+          for r in scope tests lint untested; do
+            eval "v=\${$r}"
+            case "$v" in
+              success|skipped) ;;
+              *) echo "::error::lane '$r' result: $v"; rc=1 ;;
+            esac
+          done
+
+          if [ "$scope" != success ]; then
+            echo "::error::The scope job failed, so no test selection exists."
+            rc=1
+          fi
+          exit $rc
