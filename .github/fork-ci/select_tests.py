@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -76,12 +75,26 @@ def sh(*args: str) -> str:
     ).stdout
 
 
-_RG = shutil.which("rg")
+# None = not probed yet, True/False = rg present. Probed by running it: the
+# repository's own guard (tests/test_managed_runtime_resolution.py) rejects a
+# bare PATH probe in Hermes-owned code, and this file is Hermes-owned.
+_RG: bool | None = None
+
+
+def have_rg() -> bool:
+    global _RG
+    if _RG is None:
+        try:
+            sh("rg", "--version")
+            _RG = True
+        except (OSError, subprocess.SubprocessError):
+            _RG = False
+    return _RG
 
 
 def grep_test_files(needle: str) -> list[str]:
     """Test files containing `needle`, via rg when present and plain Python when not."""
-    if _RG:
+    if have_rg():
         try:
             out = sh("rg", "-l", "--glob", "test_*.py", "--fixed-strings", needle, "tests")
             return [line.strip() for line in out.splitlines() if line.strip()]
