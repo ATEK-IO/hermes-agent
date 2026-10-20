@@ -8,11 +8,14 @@ envelope (exit code, final text, token stats). Diagnostics and ``session_id`` st
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from typing import Any
 
 _TOOL_OUTPUT_CAP = 5000
+# ATE-6946: the one lifecycle diagnostic that changes what the run means.
+_CAP_BANNER = re.compile(r"Iteration budget exhausted \(\d+/\d+\)|Reached maximum iterations \(\d+\)")
 
 
 def stream_json_requested(args) -> bool:
@@ -48,7 +51,15 @@ class StreamJsonEmitter:
         construction, before credentials/agent init, so a failed start still yields init + result)."""
         agent.stream_delta_callback = self.on_text_delta
         agent.tool_progress_callback = self.on_tool_progress
+        # ATE-6946: the turn-exit diagnostics used to stay on stderr, so a stream-json
+        # consumer could not tell a turn-capped run from a clean one. Forward the cap
+        # banner into the record stream; every other lifecycle message stays on stderr.
+        agent.status_callback = self.on_status
         return self
+
+    def on_status(self, kind: str, message: str) -> None:
+        if _CAP_BANNER.search(str(message)):
+            self._emit({"type": "status", "kind": str(kind), "message": str(message)})
 
     def on_text_delta(self, text: str | None) -> None:
         # Only None/"" (the turn-end sentinel) is dropped: whitespace deltas are part of the text, and
@@ -85,6 +96,9 @@ class StreamJsonEmitter:
         exit_code = exit_code or (1 if data.get("failed") else 0)
         payload = {"type": "result", "session_id": session_id or self._session_id, "exit_code": exit_code,
                    "text": data.get("final_response") or "",
+                   # ATE-6946: the turn result carries api_calls; without it a consumer sees
+                   # no turn count at all and cannot tell a capped run from a short one.
+                   "api_calls": data.get("api_calls"),
                    "tokens": {"input": data.get("input_tokens") or 0, "output": data.get("output_tokens") or 0,
                               "total": data.get("total_tokens") or 0, "cache_read": data.get("cache_read_tokens") or 0,
                               "cache_write": data.get("cache_write_tokens") or 0},
