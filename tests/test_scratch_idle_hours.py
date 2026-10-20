@@ -153,3 +153,29 @@ def test_default_window_is_still_24_hours(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv(constants.SCRATCH_MAX_IDLE_HOURS_ENV, raising=False)
     assert constants.SCRATCH_MAX_IDLE_HOURS == 24.0
     assert constants.scratch_max_idle_hours() == 24.0
+
+
+def test_own_cwd_inside_an_idle_entry_keeps_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pruning process is a live same-user process too (ATE-7332 B1).
+
+    A run started with its cwd inside an aged entry must not have that entry deleted underneath
+    it: ``busy_entries`` counts the own lineage, so the entry is busy and never doomed — the
+    exclusion belongs to the reap alone, where the hazard is killing the prune's own shell.
+    """
+    monkeypatch.delenv(constants.SCRATCH_MAX_IDLE_HOURS_ENV, raising=False)
+    root = constants.get_scratch_dir(tmp_path, prune=False)
+    lane = root / "lane" / "work"
+    lane.mkdir(parents=True)
+    (lane / "out.md").write_text("a live run owns this cwd", encoding="utf-8")
+    _age(root / "lane", 30)
+
+    with monkeypatch.context() as pruner:
+        pruner.chdir(lane)
+        assert os.path.realpath(str(root / "lane")) in {
+            os.path.realpath(str(entry)) for entry in scratch.busy_entries(root)
+        }
+        assert constants.prune_scratch_dir(root) == 0
+        assert lane.is_dir(), "the entry holding the pruning process's cwd was deleted"
+        assert Path(os.getcwd()) == lane

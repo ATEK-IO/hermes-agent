@@ -143,6 +143,10 @@ def _own_lineage() -> set[int]:
     return pids
 
 
+class ScanUnreliable(RuntimeError):
+    """The process scan inspected nothing, so it cannot call any entry idle."""
+
+
 def busy_entries(scratch_root: Path) -> set[Path]:
     """Top-level entries of *scratch_root* that hold a live same-user process.
 
@@ -150,34 +154,47 @@ def busy_entries(scratch_root: Path) -> set[Path]:
     filter, as :func:`reap_processes_rooted_in`. A process that merely has a file open inside an
     entry (an editor, a log tail) does not pin the tree. A deleted cwd is not a live entry: those
     orphans stay the reap's business. Returned paths are real paths.
+
+    Every same-user process counts, this one and its ancestors included: an entry that holds the
+    pruner's own cwd is busy, and deleting it would pull the tree out from under a live process.
+    Only :func:`reap_processes_rooted_in` excludes the own lineage, where self-kill is the hazard.
+
+    Unreadable processes are skipped — one ``ESRCH``/``EPERM`` says nothing about any entry — but
+    a scan that read *no* process (``ScanUnreliable``) is not an empty busy set: it raises, and the
+    caller keeps every entry rather than deleting trees it never checked.
     """
     import psutil
 
     root = os.path.realpath(str(scratch_root))
-    skip = _own_lineage()
     uid = os.getuid() if hasattr(os, "getuid") else None
     busy: set[Path] = set()
+    seen = failed = 0
     for proc in psutil.process_iter(["pid"]):
-        if proc.pid in skip:
-            continue
+        seen += 1
         try:
             if uid is not None and proc.uids().real != uid:
                 continue
             cwd = proc.cwd()
-            if not cwd or cwd.endswith(" (deleted)"):
-                continue
-            cwd_path = os.path.realpath(cwd)
         except Exception:
-            # Gone, access-denied, or a host-level guard on process inspection: we do not guess
-            # at a cwd we cannot read. The same scan feeds the reap, so an unreadable process is
-            # never signalled either.
+            # Gone, access-denied, or psutil API drift / a host-level guard on process
+            # inspection. We do not guess at a cwd we cannot read, and the count below decides
+            # whether this scan as a whole still told us anything.
+            failed += 1
             continue
+        if not cwd or cwd.endswith(" (deleted)"):
+            continue
+        cwd_path = os.path.realpath(cwd)
         if not _under(cwd_path, root):
             continue
         relative = os.path.relpath(cwd_path, root)
         if relative == os.curdir:
             continue
         busy.add(Path(root) / relative.split(os.sep, 1)[0])
+    if failed >= seen:
+        # Includes the empty scan: not one process was readable, so "no entry is busy" would be a
+        # guess. Fail closed — the ImportError path in the caller does the same for a missing
+        # psutil, and both keep every entry and warn.
+        raise ScanUnreliable(f"process scan unreliable: {failed} of {seen} process(es) could not be inspected")
     return busy
 
 
@@ -304,8 +321,9 @@ def _prune_idle_entries(
         return 0
     # The live-process guard is not optional: an entry with a same-user process rooted in it is
     # never doomed, so the reap below can only ever signal an orphan whose cwd is already gone.
-    # Without psutil there is no guard, and deleting could kill a live run — skip this pass
-    # instead (the next one is an hour away) and say so.
+    # Without a working process scan (psutil missing, or a scan that read nothing at all) there
+    # is no guard, and deleting could kill a live run — skip this pass instead (the next one is
+    # an hour away) and say so.
     try:
         busy = {os.path.realpath(str(e)) for e in busy_entries(root)}
     except Exception as exc:
@@ -319,7 +337,11 @@ def _prune_idle_entries(
     # (or by hand) are found by the deleted-cwd rule, not by membership in ``doomed``.
     try:
         reap_processes_rooted_in(root, doomed, audit)
-    except Exception as exc:  # psutil went away between the two scans: the deletion still proceeds
+    except Exception as exc:
+        # The reap is best-effort and the deletion still proceeds: ``doomed`` was computed with a
+        # live-process guard, so nothing in it holds a same-user process. A reap that could not
+        # run (psutil gone since the scan, an unreadable process table) leaves only orphans
+        # behind, and the next pass finds them by their deleted cwd.
         logger.debug("scratch prune: process reap skipped: %s", exc, exc_info=True)
     if not doomed:
         return 0
