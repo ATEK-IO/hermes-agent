@@ -47,9 +47,67 @@ def _cwd_marker_printf(marker: str) -> str:
     return f"printf '\\n{marker}%s{marker}\\n' \"$(pwd -P)\""
 
 
+# ATE-7650 / ATE-7625 rule R1: a run snapshot is an ALLOW-LIST of env names first,
+# never a whole-environment dump. This list mirrors the fleet scrubber
+# `tools/_lib/redact.mjs` (SNAPSHOT_ENV_ALLOW / SNAPSHOT_ENV_ALLOW_PREFIXES), which is
+# the ONE rule set for what a snapshot may carry; this module must stay a strict
+# SUBSET of it and `tests/tools/test_snapshot_env_allowlist.py` fails if it drifts.
+SNAPSHOT_ENV_ALLOW = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD", "SHLVL", "TERM",
+    "TERMINFO", "TMPDIR", "TMP", "TEMP", "TZ", "HOSTNAME", "LANG", "LANGUAGE", "MAIL",
+    "EDITOR", "VISUAL", "PAGER", "GIT_PAGER", "GIT_EDITOR", "MANPAGER", "LESS",
+    "COLUMNS", "LINES", "HERMES_HOME", "HERMES_REAL_HOME", "HERMES_INTERACTIVE",
+    "HERMES_QUIET", "HERMES_YOLO_MODE", "HERMES_SINGLE_QUERY_SESSION",
+    "HERMES_LESSONS_PATH", "HERMES_KANBAN_BOARD", "HERMES_UI_SESSION_ID",
+})
+
+# Per-host / per-locale families. The fleet list also allows HERMES_SESSION_* and
+# HERMES_CRON_*; they are deliberately NOT re-allowed here because this runtime unsets
+# every one of those names before the dump (#90782, #71296) - allowing the family would
+# resurrect exactly what that unset removes.
+SNAPSHOT_ENV_ALLOW_PREFIXES = ("LC_", "XDG_")
+
+# A prefix-allowed name that still reads as a credential is dropped. `PWD`/`OLDPWD` are
+# paths, not passwords, and are matched by the exact list above, not by this shape.
+SNAPSHOT_CREDENTIAL_NAME = (
+    r"(^|_)(TOKEN|TOKENS|SECRET|SECRETS|PASS|PASSWD|PASSWORD|PASSWORDS|PASSPHRASE|PWD|"
+    r"KEY|KEYS|APIKEY|CREDENTIAL|CREDENTIALS|AUTH|PRIVATE|COOKIE|SESSION_KEY)(_|$)"
+)
+
+
+def _snapshot_allowlist_emitter() -> str:
+    """Shell snippet that emits ONLY allow-listed exported vars, as ``declare -x`` lines.
+
+    Replaces the bare ``export -p``. The decision is made IN THE TARGET SHELL, not on the
+    host process: the same snippet runs through every backend (local, docker, ssh, modal,
+    singularity, vercel), and for all but ``local`` the snapshot file exists only on the
+    target, so a host-side post-processing step could not read it.
+
+    ``compgen -e`` lists exported names only, and a name that is not exported never
+    reaches the file. ``declare -p`` re-emits the value exactly as bash would source it,
+    so a value holding a newline stays inside its quotes instead of becoming a line that
+    the next ``source`` executes (#71296). Name-shape checks are case-sensitive on the
+    name; env names that carry credentials are upper-case in practice.
+    """
+    exact = "|".join(sorted(SNAPSHOT_ENV_ALLOW))
+    prefixes = "|".join(f"{prefix}*" for prefix in SNAPSHOT_ENV_ALLOW_PREFIXES)
+    return (
+        "for __hermes_n in $(compgen -e 2>/dev/null); do "
+        f"case $__hermes_n in {exact}) ;; "
+        f"{prefixes}) [[ $__hermes_n =~ {SNAPSHOT_CREDENTIAL_NAME} ]] && continue ;; "
+        "*) continue ;; esac; "
+        '__hermes_decl=$(declare -p "$__hermes_n" 2>/dev/null) || continue; '
+        "printf '%s\n' \"$__hermes_decl\"; "
+        "done; "
+    )
+
+
 def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[str] = ()) -> str:
-    """Shell snippet dumping ``export -p`` to *tmp_path* minus the per-session bridged vars (see
-    ``_SNAPSHOT_EXCLUDED_ENV_REGEX``) and *excluded_names*. The vars are ``unset`` in a subshell
+    """Shell snippet dumping the ALLOW-LISTED exported vars to *tmp_path*, minus the per-session
+    bridged vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``) and *excluded_names*. Since ATE-7650 /
+    ATE-7625 R1 the dump is ``_snapshot_allowlist_emitter()``, not a bare ``export -p``: a name the
+    fleet did not think of never reaches the file at all, so the snapshot is no longer a copy of the
+    whole environment. The vars are ``unset`` in a subshell
     BEFORE ``export -p``: a line-based ``grep -vE`` is unsafe because bash 3.2 prints a value
     containing a newline as a multi-line ``declare -x`` block, so smuggled continuation lines would
     survive into the snapshot and execute on the next ``source``. ``|| true`` keeps the success
@@ -82,7 +140,8 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # on the backend and outlive the private dir it protects.
         "${!HERMES_RPC_*} HERMES_KERNEL_DIR "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
-        "export -p; ) || true; } "
+        + _snapshot_allowlist_emitter()
+        + ") || true; } "
         f"> {tmp_path}")
 
 
