@@ -36,6 +36,9 @@ from pathlib import Path
 MAX_TESTS = 60
 MAX_CONTENT_MATCHES = 40
 
+# Every subprocess is bounded: a hang in git or rg must fail the job, not stall it.
+CMD_TIMEOUT_S = 300
+
 # Surfaces that upstream covers with lanes this fork cannot run.
 UNCOVERED = [
     (re.compile(r"^(apps/|web/|src-tauri/)"), "desktop/frontend"),
@@ -47,21 +50,30 @@ UNCOVERED = [
     (re.compile(r"^(packaging|installers?)/"), "packaging"),
 ]
 
-# Changed paths that need no executing check and are not a gap.
+# Changed paths that need no executing check and are not a gap: prose, CI
+# configuration, and the repository's own metadata.
 IGNORED = [
     re.compile(r"\.(md|mdx|txt|png|jpg|jpeg|gif|svg|ico)$"),
     re.compile(r"^docs/"),
-    re.compile(r"^\.github/(ISSUE_TEMPLATE|PULL_REQUEST_TEMPLATE|CODEOWNERS)"),
     re.compile(r"^(LICENSE|NOTICE|\.gitignore|\.editorconfig)"),
 ]
+
+# Paths that ARE the CI itself, or its tooling. Nothing here is application
+# code, so "no test references it" would be a false gap.
+CI_CONFIG = (".github/", "scripts/ci/")
 
 # Test trees this lane never runs: e2e drives real processes and takes far
 # longer than a diff-scoped lane should.
 SKIP_TEST_TREES = ("tests/e2e/", "tests/manual/", "tests/evals/")
 
+# pending entry: (source path, name matches, import matches, total matches found)
+Pending = tuple[str, list[str], list[str], int]
+
 
 def sh(*args: str) -> str:
-    return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+    return subprocess.run(
+        args, check=True, capture_output=True, text=True, timeout=CMD_TIMEOUT_S
+    ).stdout
 
 
 _RG = shutil.which("rg")
@@ -73,7 +85,7 @@ def grep_test_files(needle: str) -> list[str]:
         try:
             out = sh("rg", "-l", "--glob", "test_*.py", "--fixed-strings", needle, "tests")
             return [line.strip() for line in out.splitlines() if line.strip()]
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return []
     hits: list[str] = []
     for path in Path("tests").rglob("test_*.py"):
@@ -110,6 +122,10 @@ def skipped_test_tree(path: str) -> bool:
     return path.startswith(SKIP_TEST_TREES)
 
 
+def is_ci_config(path: str) -> bool:
+    return path.startswith(CI_CONFIG)
+
+
 def find_tests_for(path: str) -> tuple[list[str], list[str], int]:
     """Return (test files named after this module, capped import matches, total found)."""
     stem = re.sub(r"^_+", "", Path(path).stem)
@@ -139,63 +155,73 @@ def find_tests_for(path: str) -> tuple[list[str], list[str], int]:
     return named, content[:MAX_CONTENT_MATCHES], total
 
 
-def main() -> int:
-    files = changed_files()
+def kind_of(path: str) -> str:
+    """Classify one changed path. Untestable surfaces return 'untested:<label>'."""
+    if skipped_test_tree(path):
+        return "skip"
+    if is_test_file(path):
+        return "test"
+    if is_ci_config(path):
+        return "ci"
+    if path.endswith(".py"):
+        return "python"
+    for pattern, label in UNCOVERED:
+        if pattern.search(path):
+            return f"untested:{label} — no lane on this fork"
+    if any(pattern.search(path) for pattern in IGNORED):
+        return "ignore"
+    return "other"
+
+
+def collect(files: list[str]) -> tuple[list[str], list[str], list[str], list[Pending]]:
+    """Split the diff into a test list, a gap list, a summary, and per-module work."""
     tests: list[str] = []
     untested: list[str] = []
     summary: list[str] = []
-    # path -> (named, content) for the two-pass allocation below
-    pending: list[tuple[str, list[str], list[str], int]] = []
+    pending: list[Pending] = []
 
     for path in files:
-        if skipped_test_tree(path):
+        kind = kind_of(path)
+        if kind == "skip":
             summary.append(f"skip    {path}  (e2e/manual test tree — not run by this lane)")
-            continue
-
-        if is_test_file(path):
+        elif kind == "test":
             if path not in tests:
                 tests.append(path)
             summary.append(f"test    {path}")
-            continue
-
-        if path.endswith(".py"):
+        elif kind == "ci":
+            summary.append(f"ci      {path}  (CI configuration — no test lane applies)")
+        elif kind == "python":
             named, content, total = find_tests_for(path)
             if not named and not content:
                 untested.append(f"{path} (no test references it)")
                 summary.append(f"NOTEST  {path}  (no test file found)")
-                continue
-            pending.append((path, named, content, total))
-            continue
-
-        covered_by = None
-        for pattern, label in UNCOVERED:
-            if pattern.search(path):
-                covered_by = label
-                break
-        if covered_by:
-            untested.append(f"{path} ({covered_by})")
-            summary.append(f"NOTEST  {path}  ({covered_by} — no lane on this fork)")
-            continue
-
-        if any(p.search(path) for p in IGNORED):
+            else:
+                pending.append((path, named, content, total))
+        elif kind.startswith("untested:"):
+            label = kind.split(":", 1)[1]
+            untested.append(f"{path} ({label})")
+            summary.append(f"NOTEST  {path}  ({label})")
+        elif kind == "ignore":
             summary.append(f"docs    {path}  (no executing check needed)")
-            continue
+        else:
+            summary.append(f"other   {path}  (no test lane mapped — lint only)")
+    return tests, untested, summary, pending
 
-        summary.append(f"other   {path}  (no test lane mapped — lint only)")
 
-    # Pass 1: name matches for every changed module.
+def allocate_named(pending: list[Pending], tests: list[str], summary: list[str]) -> None:
+    """Pass 1: every module's name-matched tests, before any import match."""
     for path, named, _content, _total in pending:
         added = 0
         for test in named:
-            if test in tests:
+            if test in tests or len(tests) >= MAX_TESTS:
                 continue
-            if len(tests) >= MAX_TESTS:
-                break
             tests.append(test)
             added += 1
         summary.append(f"python  {path}  -> {added} test file(s) named after it")
 
-    # Pass 2: import matches, round-robin so one wide module cannot starve others.
+
+def allocate_imports(pending: list[Pending], tests: list[str]) -> None:
+    """Pass 2: import matches, round-robin so one wide module cannot starve others."""
     cursor = {path: 0 for path, _n, _c, _t in pending}
     while len(tests) < MAX_TESTS:
         progressed = False
@@ -213,25 +239,21 @@ def main() -> int:
         if not progressed:
             break
 
-    # Report what each module actually got, including what it did not.
+
+def report_samples(pending: list[Pending], tests: list[str], summary: list[str]) -> None:
+    """Name every module whose tests did not all run, with both numbers."""
     for path, named, content, total in pending:
         discovered = len({t for t in named + content})
+        total = max(total, discovered)
         got = len({t for t in named + content if t in tests})
-        if got < total or got < discovered:
-            total = max(total, discovered)
         if got < total:
             summary.append(
                 f"SAMPLED {path}  -> {got} of {total} referencing test file(s) run; "
                 f"the rest do not run in this lane"
             )
 
-    # Determinism: a stable order makes the CI log comparable across runs.
-    tests = sorted(dict.fromkeys(tests))
-    untested = list(dict.fromkeys(untested))
 
-    print("\n".join(summary))
-    print(f"\nselected {len(tests)} test file(s), {len(untested)} untested item(s)")
-
+def write_outputs(tests: list[str], untested: list[str], summary: list[str]) -> None:
     payload = {
         "tests": " ".join(tests),
         "count": str(len(tests)),
@@ -239,11 +261,29 @@ def main() -> int:
         "summary": "\n".join(summary),
     }
     out_path = os.environ.get("GITHUB_OUTPUT")
-    if out_path:
-        with open(out_path, "a", encoding="utf-8") as fh:
-            for key, value in payload.items():
-                marker = f"__FORK_CI_{key.upper()}__"
-                fh.write(f"{key}<<{marker}\n{value}\n{marker}\n")
+    if not out_path:
+        return
+    with open(out_path, "a", encoding="utf-8") as fh:
+        for key, value in payload.items():
+            marker = f"__FORK_CI_{key.upper()}__"
+            fh.write(f"{key}<<{marker}\n{value}\n{marker}\n")
+
+
+def main() -> int:
+    files = changed_files()
+    tests, untested, summary, pending = collect(files)
+
+    allocate_named(pending, tests, summary)
+    allocate_imports(pending, tests)
+    report_samples(pending, tests, summary)
+
+    # Determinism: a stable order makes the CI log comparable across runs.
+    tests = sorted(dict.fromkeys(tests))
+    untested = list(dict.fromkeys(untested))
+
+    print("\n".join(summary))
+    print(f"\nselected {len(tests)} test file(s), {len(untested)} untested item(s)")
+    write_outputs(tests, untested, summary)
     return 0
 
 
