@@ -26,7 +26,7 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL, SCHEMA_SQL,
     SCHEMA_VERSION, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS, _ephemeral_child_sql, _sql_json_extract, fts_rebuild_admission,
 )
-from hermes_state_fts import _drop_orphan_fts_shadow_tables
+from hermes_state_fts import _drop_orphan_fts_shadow_tables, trigram_fts_config_enabled
 from hermes_state_holders import _read_proc_argv
 from hermes_state_search import _delete_meta, _meta_row
 from hermes_state_errors import is_sqlite_lock_error
@@ -265,7 +265,8 @@ class SessionSchemaMixin:
         # Re-apply current DDL (legacy vs v23 as _init_schema does) so CREATE TRIGGER installs OF variants.
         base_sql, trigram_sql = _FTS_DDL[legacy_layout]
         self._ensure_fts_schema(cursor, "messages_fts", base_sql)
-        self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
+        if trigram_fts_config_enabled():
+            self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
         # Only recreate the CJK trigger this migration dropped. ``_ensure_fts_cjk_schema`` soft-fails
         # (never raises), so afterwards require a narrowed trigger or durable quarantine.
         if "messages_fts_cjk_update" in to_drop:
@@ -392,6 +393,30 @@ class SessionSchemaMixin:
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,),
         ).fetchone() is not None
 
+    def _drop_fts_trigram_family(self, cursor: sqlite3.Cursor) -> bool:
+        """Remove ``messages_fts_trigram`` and its sync triggers for good (``sessions.fts_trigram=false``).
+
+        Triggers first, then the virtual table: FTS5 owns the shadow tables (``_data``, ``_idx``,
+        ``_docsize``, ``_config``) and they go with the ``DROP``. No ``'rebuild'`` and no
+        ``'delete-all'`` is issued, so ``messages`` is never scanned; freed pages stay in the file
+        for reuse by the surviving index (the page count only falls on a later VACUUM, which this
+        path never runs). Idempotent: on a second open every statement is an ``IF EXISTS`` no-op,
+        so a fleet of writers racing the first open costs one DROP and a handful of no-ops.
+        Returns True when a family was actually removed.
+        """
+        present = self._sqlite_table_exists(cursor, "messages_fts_trigram")
+        for name in _FTS_TRIGRAM_TRIGGERS:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {name}")  # names from the literal allowlist
+        cursor.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+        cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+        self._trigram_available = False
+        if present:
+            logger.warning(
+                "sessions.fts_trigram=false: dropped messages_fts_trigram with no rebuild; "
+                "CJK and non-prefix substring searches route to the LIKE scan",
+            )
+        return present
+
     def _migrate_trigram_cron_exclusion(self, cursor: sqlite3.Cursor) -> bool:
         """Install the source-filtered trigram view and purge historical rows (v29 cron exclusion,
         v30 subagent exclusion: both only change the view/trigger predicate and rebuild from it).
@@ -400,6 +425,11 @@ class SessionSchemaMixin:
         the view underneath would make 'rebuild' read a column the view no longer has. Otherwise
         the inverted index still holds excluded rows until FTS5 rebuilds from the new view, which
         runs under the shared cross-process admission gate. Returns False to hold schema_version back."""
+        if not trigram_fts_config_enabled():
+            # ``sessions.fts_trigram=false``: there is no family to re-view or rebuild. Returning
+            # True lets the version advance; ``_init_fts`` drops any family left by an older
+            # process and refuses to create one, so this migration has nothing to converge on.
+            return True
         if self._db_has_legacy_inline_fts(cursor) or self._db_has_trigram_tool_calls_projection(cursor):
             return True
         trigram_exists = self._fts_table_probe(cursor, "messages_fts_trigram")
@@ -642,12 +672,14 @@ class SessionSchemaMixin:
         """Body of :meth:`_recover_stale_fts`; caller holds rebuild authority. One write
         transaction, so no canonical writer slips between rebuild and trigger restoration."""
         try:
-            trigram_present = self._fts_table_probe(cursor, "messages_fts_trigram") is True
+            trigram_present = trigram_fts_config_enabled() and self._fts_table_probe(cursor, "messages_fts_trigram") is True
         except (sqlite3.DatabaseError, UnicodeDecodeError):
             # A corrupt vtable may fail even a LIMIT 0 probe; still include it in the drop-and-recreate.
-            include_trigram = True
+            include_trigram = trigram_fts_config_enabled()
         else:
-            include_trigram = trigram_present or (not legacy and self._trigram_tokenizer_available(cursor))
+            include_trigram = trigram_present or (
+                trigram_fts_config_enabled() and not legacy and self._trigram_tokenizer_available(cursor)
+            )
 
         drop_sql = "".join(f"DROP TRIGGER IF EXISTS {trigger};" for trigger in _FTS_TRIGGERS)
         if include_trigram:
@@ -1220,6 +1252,12 @@ class SessionSchemaMixin:
         OPT-IN v23 boundary: a legacy v22 inline install keeps its inline schema + triggers
         (the v23 DDL would create the trigram source VIEW and leave a mixed state)."""
         legacy_fts = self._db_has_legacy_inline_fts(cursor)
+        # ``sessions.fts_trigram=false``: the trigram family is not part of this store. Drop any
+        # family an older process left (no rebuild, no scan of ``messages``) before orphan repair
+        # and stale recovery decide what to recreate, and hold every ensure path below off it.
+        trigram_wanted = trigram_fts_config_enabled()
+        if not trigram_wanted:
+            self._drop_fts_trigram_family(cursor)
         # A `.recover`-restored image keeps the shadow tables but not the vtable rows; the DDL
         # below would fail on the first shadow. Drop only orphaned families, then rebuild the
         # recreated (empty) index like a missing-trigger repair (#103840).
@@ -1241,7 +1279,7 @@ class SessionSchemaMixin:
             base_triggers_missing = (
                 self._fts_triggers_missing(cursor, _FTS_BASE_TRIGGERS) or "messages_fts" in orphan_repaired
             )
-            trigram_triggers_missing = (
+            trigram_triggers_missing = trigram_wanted and (
                 self._fts_triggers_missing(cursor, _FTS_TRIGRAM_TRIGGERS) or "messages_fts_trigram" in orphan_repaired
             )
 
@@ -1249,7 +1287,9 @@ class SessionSchemaMixin:
                 self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", base_sql)
                 if not self._fts_enabled:
                     return
-                self._trigram_available = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
+                self._trigram_available = (
+                    self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql) if trigram_wanted else False
+                )
                 self._rebuild_fts_indexes(
                     cursor, legacy=legacy_fts, include_trigram=self._trigram_available,
                 )
@@ -1265,7 +1305,9 @@ class SessionSchemaMixin:
                 self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", base_sql)
                 if self._fts_enabled:
                     # Trigram is optional; without it CJK search falls back to LIKE.
-                    trigram_enabled = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
+                    trigram_enabled = (
+                        self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql) if trigram_wanted else False
+                    )
                     self._trigram_available = trigram_enabled
                     if trigram_enabled and trigram_triggers_missing:
                         self._run_admitted_startup_rebuild(

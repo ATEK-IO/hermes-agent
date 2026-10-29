@@ -109,6 +109,19 @@ def _cjk_fts_config_enabled() -> bool:
     return value is None or str(value).strip().lower() not in ("0", "false", "off", "no")
 
 
+def trigram_fts_config_enabled() -> bool:
+    """config.yaml ``sessions.fts_trigram`` (default on) for the profile being served.
+
+    ``False`` means ``messages_fts_trigram`` is not part of this store: schema ensure drops an
+    existing family once (never rebuilds it, never scans ``messages``) and every later ensure
+    path — schema init, cron-exclusion migration, UPDATE-OF migration, optimize-storage,
+    stale-index recovery — must skip it, or the 4 GB family comes straight back. Substring and
+    CJK searches then take the LIKE route already used on hosts without the trigram tokenizer.
+    """
+    value = routed_sessions_setting("fts_trigram", "HERMES_FTS_TRIGRAM")
+    return value is None or str(value).strip().lower() not in ("0", "false", "off", "no")
+
+
 def load_fts5_cjk_extension(conn: sqlite3.Connection) -> bool:
     """Best-effort load of the cjk_unicode61 tokenizer; False (never raises) when
     the .so is absent, ``sessions.cjk_fts`` is off, or loading is compiled out."""
