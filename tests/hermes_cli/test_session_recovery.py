@@ -759,6 +759,65 @@ def test_recovery_regenerates_rather_than_copies_derived_fts_meta(tmp_path: Path
     assert not keys & {"fts_rebuild_high_water", "fts_rebuild_progress", "fts_tool_full_content_high_water"}
 
 
+def test_recovery_finalizes_when_trigram_family_is_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``sessions.fts_trigram: false`` leaves the destination with only ``messages_fts``.
+
+    The destination is a fresh ``SessionDB``, i.e. the same gated schema path, so the trigram
+    family is legitimately absent there. Requiring it unconditionally made every recovery on a
+    key-off host end ``finalized: false`` with "fresh destination is missing required FTS
+    tables" — on the emergency salvage path, on the host that sets the key (ATE-13813 B1).
+    """
+
+    source = tmp_path / "state.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    monkeypatch.setenv("HERMES_FTS_TRIGRAM", "false")
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    derived = report["derived_metadata"]
+    assert derived["finalized"] is True, derived
+    assert derived["fts_tables"] == ["messages_fts"]
+    assert "error" not in derived
+    assert report["complete"] is True
+    assert report["verified"] is True
+    assert report["verification"]["fts_checks"] == {"messages_fts": "ok"}
+
+    conn = sqlite3.connect(str(output))
+    try:
+        names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+    assert "messages_fts" in names
+    assert not {name for name in names if name.startswith("messages_fts_trigram")}
+
+
+def test_finalize_derived_metadata_still_requires_the_base_fts_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gating the trigram requirement must not weaken the ``messages_fts`` check."""
+
+    from hermes_cli import session_recovery
+
+    store = tmp_path / "state.db"
+    monkeypatch.setenv("HERMES_FTS_TRIGRAM", "false")
+    SessionDB(db_path=store).close()
+
+    conn = sqlite3.connect(str(store))
+    try:
+        conn.execute("DROP TABLE messages_fts")
+        conn.commit()
+        derived = session_recovery._finalize_derived_metadata(conn)
+    finally:
+        conn.close()
+
+    assert derived["finalized"] is False
+    assert derived["missing_fts_tables"] == ["messages_fts"]
+    assert derived["error"] == "fresh destination is missing required FTS tables"
+
+
 def test_recovery_without_delivery_ledger_is_not_lossy(tmp_path: Path) -> None:
     """CLI-only stores never created the lazy table; that is not data loss."""
 

@@ -12,6 +12,7 @@ import time
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
+from hermes_state_fts import trigram_fts_config_enabled
 from hermes_state_errors import is_malformed_db_error
 from hermes_state_common import (
     FTS_CJK_STALE_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
@@ -601,7 +602,11 @@ class SessionSearchMixin:
         *failure_message* without the base table (the backfill loop would retry forever)."""
         with self._lock:
             base_ok = self._ensure_fts_schema(self._conn, "messages_fts", FTS_SQL)
-            trigram_ok = self._ensure_fts_schema(self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL)
+            # ``sessions.fts_trigram=false``: never resurrect the family from optimize-storage.
+            trigram_ok = (
+                self._ensure_fts_schema(self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL)
+                if trigram_fts_config_enabled() else False
+            )
             self._trigram_available = bool(trigram_ok)
             if not base_ok:
                 raise sqlite3.OperationalError(failure_message)
@@ -1172,6 +1177,14 @@ class SessionSearchMixin:
                 matches = self._match_rows("messages_fts_cjk", fb_query, **route) or matches
             if not matches and self._trigram_available and self._trigram_eligible_tokens(query):
                 matches = self._match_rows("messages_fts_trigram", fb_query, **route) or matches
+            if not matches and not self._trigram_available and not trigram_fts_config_enabled():
+                # ``sessions.fts_trigram=false``: the index that served non-prefix substring and
+                # mixed-script queries is absent by design, so take the next path the code already
+                # has (the LIKE scan) instead of returning nothing. Gated on a miss, so a query the
+                # unicode61 index answers never pays for it.
+                matches = self._search_messages_like_fallback(
+                    query, limit=limit, offset=offset, sort=sort, **filters,
+                )
 
         # OR-relaxed retry: the implicit AND between terms means a paraphrased multi-word query
         # misses a stored sentence that lacks even ONE word ("when does Sarah like her standup
