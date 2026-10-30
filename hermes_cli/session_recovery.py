@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterator, Optional
 from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
 from hermes_state import SessionDB
 from hermes_state_common import FTS_STORAGE_VERSION, SCHEMA_VERSION
+from hermes_state_fts import trigram_fts_config_enabled
 from hermes_state_repair import _db_opens_cleanly
 
 
@@ -992,7 +993,16 @@ def _finalize_derived_metadata(destination: sqlite3.Connection) -> dict[str, Any
     result: dict[str, Any] = {
         "fts_tables": sorted(fts_tables), "finalized": False, "model_config_reset": model_config_reset,
         "timestamps_repaired": timestamps_repaired}
-    if fts_tables != {"messages_fts", "messages_fts_trigram"}:
+    # ``messages_fts_trigram`` is required only while ``sessions.fts_trigram`` is on: with the key
+    # off the family is legitimately absent from every store this code opens, including a fresh
+    # destination, so requiring it unconditionally made every recovery end ``finalized: false``
+    # (ATE-13813 review B1). ``messages_fts`` is always required.
+    required_fts_tables = {"messages_fts"}
+    if trigram_fts_config_enabled():
+        required_fts_tables.add("messages_fts_trigram")
+    missing_fts_tables = sorted(required_fts_tables - fts_tables)
+    if missing_fts_tables:
+        result["missing_fts_tables"] = missing_fts_tables
         result["error"] = "fresh destination is missing required FTS tables"
         return result
     fts_keys = tuple(key for key in _GENERATED_META_KEYS if key.startswith("fts_"))
