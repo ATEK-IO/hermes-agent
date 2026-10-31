@@ -719,10 +719,11 @@ class ClientLifecycleMixin:
             except ImportError:
                 return None
             custom_provider = _get_named_custom_provider(getattr(self, "requested_provider", "") or "")
-            from hermes_cli.providers import first_key_env
-            # One env probe: a list ``key_env`` contributes its first name.
-            key_env = first_key_env((custom_provider or {}).get("key_env") or "")
-            api_key = get_env_prefer_dotenv(key_env).strip() if key_env else ""
+            from hermes_cli.providers import resolve_key_env_chain
+            # Walk the declared chain in order: a list ``key_env`` reads the seat key first and falls
+            # back to the shared key when the seat has none (gateway/cron shape).
+            key_env_value = (custom_provider or {}).get("key_env") or (custom_provider or {}).get("api_key_env") or ""
+            api_key = resolve_key_env_chain(key_env_value, get_env_prefer_dotenv)
             if not custom_provider or not api_key:
                 return None
             # Custom providers pin base_url in config, so only key edits are adopted here.

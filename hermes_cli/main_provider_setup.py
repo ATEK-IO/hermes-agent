@@ -477,7 +477,9 @@ def _custom_provider_api_key_config_value(provider_info, resolved_api_key=""):
     api_key_ref = str(provider_info.get("api_key_ref", "") or "").strip()
     if api_key_ref:
         return api_key_ref
-    key_env = str(provider_info.get("key_env", "") or "").strip()
+    from hermes_cli.providers import first_key_env
+
+    key_env = first_key_env(provider_info.get("key_env") or "")
     if key_env and not str(provider_info.get("api_key", "") or "").strip():
         return f"${{{key_env}}}"
     return str(resolved_api_key or "").strip()

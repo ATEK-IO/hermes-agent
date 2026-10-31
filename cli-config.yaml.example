@@ -213,6 +213,8 @@ model:
 #     key_env: [MY_AGENT_KEY, MY_SHARED_KEY]   # agent key first, shared key second
 #     # a plain string (`key_env: MY_SHARED_KEY`) behaves exactly as before, and the
 #     # settings UI, the model picker and `model.key_env` keep using the FIRST name.
+#     # The order is walked by the resolver that builds the provider client, so a
+#     # gateway/cron/CLI run with no agent key uses MY_SHARED_KEY, never a placeholder.
 # Fast/priority tier behind an OpenAI-compatible gateway or proxy: agent.service_tier
 # (`/fast`) only reaches first-party endpoints; ask a gateway for its own tier via
 # extra_body, which is merged into every request routed to that provider.

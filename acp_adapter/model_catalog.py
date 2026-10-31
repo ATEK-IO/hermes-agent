@@ -58,10 +58,11 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
 
         api_key = field("api_key")
         if not api_key:
-            from hermes_cli.providers import first_key_env
-            # One name is all an env probe can honour: take the chain's first name.
-            key_env = first_key_env(entry.get("key_env") or entry.get("api_key_env") or "")
-            api_key = os.environ.get(key_env, "").strip() if key_env else ""
+            from hermes_cli.providers import resolve_key_env_chain
+            # Walk the declared chain: an unset first name (no seat key) must fall through to the
+            # next one, or the provider drops out of the catalogue it is perfectly able to serve.
+            api_key = resolve_key_env_chain(entry.get("key_env") or entry.get("api_key_env") or "",
+                                            lambda name: os.environ.get(name, ""))
 
         models_cfg = entry.get("models")
         declared = [m for m in dict.fromkeys([field("model"), *_declared_model_ids(models_cfg)]) if m]

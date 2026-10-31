@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from utils import base_url_host_matches, base_url_hostname
 
@@ -425,6 +425,21 @@ def first_key_env(value: Any) -> str:
     """The single name to use where only one ``key_env`` can be honoured: ``""`` when none."""
     names = provider_key_env_names(value)
     return names[0] if names else ""
+
+
+def resolve_key_env_chain(value: Any, resolve: Callable[[str], str]) -> str:
+    """First usable secret along an ordered ``key_env`` chain, or ``""`` when no name resolves.
+
+    ``resolve`` maps a variable name to its value and owns the precedence (dotenv-preferring,
+    scope-aware, …) — this helper owns only the ORDER. Names are tried as declared and reading stops
+    at the first non-empty value, so a list costs one env probe when the first rung is present and an
+    unset/empty first name falls through to the second. A plain string behaves exactly as before.
+    """
+    for name in provider_key_env_names(value):
+        val = (resolve(name) or "").strip()
+        if val:
+            return val
+    return ""
 
 
 def _user_pdef(pid: str, name: str, base_url: str, key_env: Any, transport: str = "openai_chat") -> ProviderDef:

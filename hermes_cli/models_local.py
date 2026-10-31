@@ -125,8 +125,11 @@ def _api_key_from_provider_config(entry: dict, *env_keys: str) -> str:
     api_key = str(entry.get("api_key") or "").strip()
     if api_key:
         return api_key
-    key_env = str(next((entry.get(k) for k in env_keys if entry.get(k)), "") or "").strip()
-    return get_secret_str(key_env, "").strip() if key_env else ""
+    from hermes_cli.providers import resolve_key_env_chain
+
+    # A list ``key_env`` is an ordered chain: walk it in declared order, first usable value wins.
+    key_env_value = next((entry.get(k) for k in env_keys if entry.get(k)), "") or ""
+    return resolve_key_env_chain(key_env_value, lambda name: get_secret_str(name, ""))
 
 
 def _drop_authorization(headers: dict[str, str]) -> None:

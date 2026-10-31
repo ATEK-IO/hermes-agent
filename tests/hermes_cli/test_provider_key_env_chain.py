@@ -215,3 +215,108 @@ class TestSingleNameReadersUseTheFirstName:
         assert auth._model_level_key_env("litellm") == "LITELLM_KEY"
         # A provider other than the configured one is still not consulted.
         assert auth._model_level_key_env("openrouter") == ""
+
+
+class TestRuntimeResolverWalksTheChain:
+    """``resolve_runtime_provider`` — the resolver that builds the CLIENT — walks the chain.
+
+    This is the path an agent run actually uses (``_resolve_named_custom_runtime`` →
+    ``_key_env_secret`` / ``_match_new_style_provider``). A chain honoured only by the auth path
+    resolves the ``no-key-required`` placeholder here and 401s at the gateway: exactly the failure
+    the list form exists to prevent, and the one a test that stops at
+    ``_resolve_api_key_provider_secret`` cannot see.
+    """
+
+    @staticmethod
+    def _configure(monkeypatch, key_env, *, provider="litellm", legacy=False):
+        from hermes_cli import runtime_provider as rp
+
+        if legacy:
+            cfg = {
+                "custom_providers": [
+                    {
+                        "name": provider,
+                        "base_url": "http://vm.atek.vpn:4200",
+                        "key_env": key_env,
+                    }
+                ],
+                "model": {"provider": provider, "default": "seat-model"},
+            }
+        else:
+            cfg = {
+                "providers": {
+                    provider: {
+                        "name": provider,
+                        "base_url": "http://vm.atek.vpn:4200",
+                        "key_env": key_env,
+                        "default_model": "seat-model",
+                    }
+                },
+                "model": {"provider": provider, "default": "seat-model"},
+            }
+        monkeypatch.setattr(rp, "load_config", lambda *a, **k: cfg)
+        monkeypatch.setattr(rp, "_get_model_config", lambda *a, **k: cfg["model"])
+        # No credential pool in a scratch home: the pool is a later rung and must not answer first.
+        monkeypatch.setattr(rp, "load_pool", lambda _p: SimpleNamespace(has_credentials=lambda: False))
+
+    def test_first_name_wins_when_both_are_set(self, isolated_hermes_home, monkeypatch):
+        self._configure(monkeypatch, ["LITELLM_KEY", "LITELLM_API_KEY"])
+        monkeypatch.setenv("LITELLM_KEY", "sk-seat-1111")
+        monkeypatch.setenv("LITELLM_API_KEY", "sk-shared-2222")
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        assert resolve_runtime_provider(requested="litellm")["api_key"] == "sk-seat-1111"
+
+    def test_unset_first_name_falls_through_to_the_second(self, isolated_hermes_home, monkeypatch):
+        """The gateway/cron shape: the seat key is absent from the process, the shared key is not."""
+        self._configure(monkeypatch, ["LITELLM_KEY", "LITELLM_API_KEY"])
+        monkeypatch.delenv("LITELLM_KEY", raising=False)
+        monkeypatch.setenv("LITELLM_API_KEY", "sk-shared-2222")
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        api_key = resolve_runtime_provider(requested="litellm")["api_key"]
+        assert api_key == "sk-shared-2222"
+        assert api_key != "no-key-required"
+
+    def test_empty_first_name_falls_through_to_the_second(self, isolated_hermes_home, monkeypatch):
+        self._configure(monkeypatch, ["LITELLM_KEY", "LITELLM_API_KEY"])
+        monkeypatch.setenv("LITELLM_KEY", "")
+        monkeypatch.setenv("LITELLM_API_KEY", "sk-shared-2222")
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        assert resolve_runtime_provider(requested="litellm")["api_key"] == "sk-shared-2222"
+
+    def test_order_is_the_contract(self, isolated_hermes_home, monkeypatch):
+        """Declaring the shared key first makes it the winner, both keys present."""
+        self._configure(monkeypatch, ["LITELLM_API_KEY", "LITELLM_KEY"])
+        monkeypatch.setenv("LITELLM_KEY", "sk-seat-1111")
+        monkeypatch.setenv("LITELLM_API_KEY", "sk-shared-2222")
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        assert resolve_runtime_provider(requested="litellm")["api_key"] == "sk-shared-2222"
+
+    def test_string_key_env_is_unchanged(self, isolated_hermes_home, monkeypatch):
+        """Every other provider entry keeps its pre-list behaviour: one name, same result."""
+        self._configure(monkeypatch, "LITELLM_API_KEY")
+        monkeypatch.setenv("LITELLM_API_KEY", "sk-shared-2222")
+        monkeypatch.setenv("LITELLM_KEY", "sk-seat-1111")
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        resolved = resolve_runtime_provider(requested="litellm")
+        # One name means one rung: a seat key exported in the same process does not win.
+        assert resolved["api_key"] == "sk-shared-2222"
+
+    def test_legacy_custom_providers_entry_walks_the_chain(self, isolated_hermes_home, monkeypatch):
+        """The legacy list form gets the same order, not ``str(['A', 'B'])``."""
+        self._configure(monkeypatch, ["LITELLM_KEY", "LITELLM_API_KEY"], legacy=True)
+        monkeypatch.delenv("LITELLM_KEY", raising=False)
+        monkeypatch.setenv("LITELLM_API_KEY", "sk-shared-2222")
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        assert resolve_runtime_provider(requested="litellm")["api_key"] == "sk-shared-2222"
