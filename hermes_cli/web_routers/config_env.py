@@ -411,7 +411,9 @@ def _api_key_display(entry: dict[str, Any]) -> tuple[bool, Optional[str]]:
     plaintext = str(entry.get("api_key") or "").strip()
     if plaintext:
         return True, redacted_credential_preview(plaintext)
-    key_env = str(entry.get("key_env") or "").strip()
+    from hermes_cli.providers import first_key_env
+    # A list ``key_env`` is a chain: show the first name it resolves through.
+    key_env = first_key_env(entry.get("key_env") or entry.get("api_key_env") or "")
     if key_env:
         return True, f"${{{key_env}}}"
     return False, None

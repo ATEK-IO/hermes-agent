@@ -38,21 +38,42 @@ def _clean(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _key_env_secret(entry: dict[str, Any], label: str) -> str:
-    """The credential named by ``key_env`` / ``api_key_env`` on a config block, or "".
+def _key_env_names(entry: dict[str, Any]) -> tuple[str, ...]:
+    """The declared ``key_env`` chain on a config block, in order (``api_key_env_vars`` when the
+    runtime dict already carries the normalised chain), or ``()`` when the block declares none."""
+    from hermes_cli.providers import provider_key_env_names
 
-    A declared variable that resolves to nothing is logged: every custom rung substitutes
-    ``no-key-required`` for an empty key (keyless local servers), so a misnamed or unexported
-    variable otherwise surfaces only as the provider's 401/403 (#67453). A block with no key_env at
-    all stays silent — that IS the keyless-server configuration.
+    declared = entry.get("api_key_env_vars")
+    if declared:
+        names = provider_key_env_names(declared)
+        if names:
+            return names
+    return provider_key_env_names(entry.get("key_env") or entry.get("api_key_env") or "")
+
+
+def _key_env_secret(entry: dict[str, Any], label: str) -> str:
+    """The credential named by the ``key_env`` / ``api_key_env`` chain on a config block, or "".
+
+    A list ``key_env`` is an ordered chain (per-seat key first, shared key second) and is walked in
+    declared order: the first name holding a value wins, an unset or empty name falls through to the
+    next. Reading the FIRST name only is what made a gateway/cron process (no seat key) resolve the
+    ``no-key-required`` placeholder instead of the shared key.
+
+    A chain where no name resolves is logged once: every custom rung substitutes ``no-key-required``
+    for an empty key (keyless local servers), so a misnamed or unexported variable otherwise surfaces
+    only as the provider's 401/403 (#67453). A block with no key_env at all stays silent — that IS
+    the keyless-server configuration.
     """
-    key_env = _clean(entry.get("key_env") or entry.get("api_key_env"))
-    if not key_env:
+    from hermes_cli.providers import resolve_key_env_chain
+
+    names = _key_env_names(entry)
+    if not names:
         return ""
-    value = get_secret_str(key_env, "").strip()
+    value = resolve_key_env_chain(names, lambda name: get_secret_str(name, ""))
     if not value:
-        logger.warning("%s: key_env %s is set but the variable is empty/unset — the request will carry the "
-                       "placeholder no-key-required and the endpoint will reject it", label, key_env)
+        logger.warning("%s: key_env %s %s but the variable is empty/unset — the request will carry the "
+                       "placeholder no-key-required and the endpoint will reject it",
+                       label, "/".join(names), "is set" if len(names) == 1 else "chain is declared")
     return value
 
 
@@ -99,11 +120,24 @@ def _lift_extra_headers(entry: dict[str, Any], result: dict[str, Any]) -> None:
         result["extra_headers"] = extra_headers
 
 
-def _lift_common_custom_fields(entry: dict[str, Any], result: dict[str, Any], *, provider_key: str, key_env: str,
+def _lift_common_custom_fields(entry: dict[str, Any], result: dict[str, Any], *, provider_key: str, key_env: Any,
                                api_mode: Optional[str]) -> None:
-    """Copy the optional fields shared by ``providers:`` and legacy ``custom_providers:`` entries."""
-    if key_env:
-        result["key_env"] = key_env
+    """Copy the optional fields shared by ``providers:`` and legacy ``custom_providers:`` entries.
+
+    ``key_env`` is a name or an ordered list. The chain is kept on ``api_key_env_vars`` for the
+    credential resolver to walk; ``key_env`` carries its FIRST name, the one variable that fits where
+    the field is read as a single name (display, ``str(...)`` never reaches config).
+    """
+    from hermes_cli.providers import provider_key_env_names
+
+    # A normalised entry carries the whole chain on ``api_key_env_vars`` and keeps only the first
+    # name on ``key_env``; prefer the chain or a legacy list would be collapsed to one rung.
+    declared_chain = provider_key_env_names(entry.get("api_key_env_vars") or "")
+    key_env_names = declared_chain if len(declared_chain) > 1 else provider_key_env_names(key_env)
+    if key_env_names:
+        result["key_env"] = key_env_names[0]
+        if len(key_env_names) > 1:
+            result["api_key_env_vars"] = key_env_names
     if provider_key:
         result["provider_key"] = provider_key
     extra_body = entry.get("extra_body")
@@ -151,8 +185,12 @@ def _match_new_style_provider(requested_norm: str, providers: dict[str, Any]) ->
             continue
         # Resolve credentials only after identity and endpoint validation. Merely scanning an
         # unrelated entry must not read its profile-scoped secret.
-        key_env = _clean(entry.get("key_env") or entry.get("api_key_env"))
-        api_key = get_secret_str(key_env, "").strip() if key_env else ""
+        from hermes_cli.providers import resolve_key_env_chain
+        # The chain is walked in declared order: the first name holding a value wins, an unset or
+        # empty first name falls through to the next (``str(['A', 'B'])`` would name a variable
+        # nobody exports). ``key_env`` keeps the first name for identity/display.
+        key_env_value = entry.get("key_env") or entry.get("api_key_env") or ""
+        api_key = resolve_key_env_chain(key_env_value, lambda name: get_secret_str(name, ""))
         result: dict[str, Any] = {"name": entry.get("name", ep_name), "base_url": base_url.strip(),
                                   "api_key": api_key or _clean(entry.get("api_key", "")), "model": entry.get("default_model", "")}
         # Command that PRINTS a short-lived credential; wrapped in a per-request token provider.
@@ -162,7 +200,7 @@ def _match_new_style_provider(requested_norm: str, providers: dict[str, Any]) ->
         # v12 migration writes ``transport``; hand-edited configs may still use ``api_mode``.
         # Accept both or migrated configs silently downgrade to chat_completions.
         _lift_common_custom_fields(
-            entry, result, provider_key=_clean(ep_name), key_env=key_env,
+            entry, result, provider_key=_clean(ep_name), key_env=key_env_value,
             api_mode=rp._parse_api_mode(entry.get("api_mode") or entry.get("transport")),
         )
         return result
@@ -182,7 +220,8 @@ def _match_legacy_custom_provider(requested_norm: str, custom_providers) -> Opti
         model_name = _clean(entry.get("model", ""))
         if model_name:
             result["model"] = model_name
-        _lift_common_custom_fields(entry, result, provider_key=provider_key, key_env=_clean(entry.get("key_env", "")),
+        _lift_common_custom_fields(entry, result, provider_key=provider_key,
+                                   key_env=entry.get("key_env") or entry.get("api_key_env") or "",
                                    api_mode=_rp()._parse_api_mode(entry.get("api_mode")))
         return result
     return None
