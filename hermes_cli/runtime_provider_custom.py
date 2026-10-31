@@ -46,7 +46,10 @@ def _key_env_secret(entry: dict[str, Any], label: str) -> str:
     variable otherwise surfaces only as the provider's 401/403 (#67453). A block with no key_env at
     all stays silent — that IS the keyless-server configuration.
     """
-    key_env = _clean(entry.get("key_env") or entry.get("api_key_env"))
+    from hermes_cli.providers import first_key_env
+    # One variable is resolved here; a list ``key_env`` is a chain and its FIRST name is the rung
+    # this call can honour (``str(['A', 'B'])`` would name a variable nobody exports).
+    key_env = first_key_env(entry.get("key_env") or entry.get("api_key_env") or "")
     if not key_env:
         return ""
     value = get_secret_str(key_env, "").strip()
@@ -151,7 +154,10 @@ def _match_new_style_provider(requested_norm: str, providers: dict[str, Any]) ->
             continue
         # Resolve credentials only after identity and endpoint validation. Merely scanning an
         # unrelated entry must not read its profile-scoped secret.
-        key_env = _clean(entry.get("key_env") or entry.get("api_key_env"))
+        from hermes_cli.providers import first_key_env
+        # One variable is resolved here; a list ``key_env`` is a chain and its FIRST name is the
+        # rung this call can honour (``str(['A', 'B'])`` would name a variable nobody exports).
+        key_env = first_key_env(entry.get("key_env") or entry.get("api_key_env") or "")
         api_key = get_secret_str(key_env, "").strip() if key_env else ""
         result: dict[str, Any] = {"name": entry.get("name", ep_name), "base_url": base_url.strip(),
                                   "api_key": api_key or _clean(entry.get("api_key", "")), "model": entry.get("default_model", "")}

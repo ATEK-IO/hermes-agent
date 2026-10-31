@@ -636,7 +636,10 @@ def _resolve_assignment_credentials(model_cfg: dict, provider: str, provider_ent
         raw_entry = None
     if not isinstance(raw_entry, dict):
         raw_entry = {}
-    key_env = str(raw_entry.get("key_env") or "").strip()
+    from hermes_cli.providers import first_key_env
+    # ``model.key_env`` is a single pointer: a list ``providers.<name>.key_env`` is carried as its
+    # first name, so the Desktop-UI assignment path never writes ``str(['A', 'B'])``.
+    key_env = first_key_env(raw_entry.get("key_env") or raw_entry.get("api_key_env") or "")
     if key_env:
         model_cfg["key_env"] = key_env
         # #88990: carry the credential POINTER, never a resolved secret.

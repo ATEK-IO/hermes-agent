@@ -58,7 +58,9 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
 
         api_key = field("api_key")
         if not api_key:
-            key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+            from hermes_cli.providers import first_key_env
+            # One name is all an env probe can honour: take the chain's first name.
+            key_env = first_key_env(entry.get("key_env") or entry.get("api_key_env") or "")
             api_key = os.environ.get(key_env, "").strip() if key_env else ""
 
         models_cfg = entry.get("models")

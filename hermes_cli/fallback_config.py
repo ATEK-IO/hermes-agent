@@ -48,9 +48,12 @@ def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
         return None
     if inline := str(entry.get("api_key") or "").strip():
         return inline
-    if key_env := str(entry.get("key_env") or entry.get("api_key_env") or "").strip():
-        from agent.secret_scope import get_secret
-        return (get_secret(key_env) or "").strip() or None
+    from hermes_cli.providers import provider_key_env_names
+    # ``key_env`` may be an ordered chain: walk it in order, first usable value wins.
+    from agent.secret_scope import get_secret
+    for key_env in provider_key_env_names(entry.get("key_env") or entry.get("api_key_env") or ""):
+        if value := (get_secret(key_env) or "").strip():
+            return value
     return None
 
 

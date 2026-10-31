@@ -393,9 +393,47 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
 
 # -- Provider from user config ------------------------------------------------
 
-def _user_pdef(pid: str, name: str, base_url: str, key_env: str, transport: str = "openai_chat") -> ProviderDef:
-    """``source="user-config"`` ProviderDef shared by ``providers:`` and ``custom_providers:`` entries."""
-    return ProviderDef(id=pid, name=name, transport=transport, api_key_env_vars=(key_env,) if key_env else (),
+def provider_key_env_names(value: Any) -> tuple[str, ...]:
+    """Normalize a config block's ``key_env`` to an ordered tuple of env-var names.
+
+    ``key_env`` takes one variable name (the documented form) and also an ordered *list*, so a
+    provider can declare a credential chain — e.g. ``[LITELLM_KEY, LITELLM_API_KEY]`` reads the
+    per-seat key when the seat has one and falls back to the shared key in a gateway/cron process.
+    The chain lands on ``ProviderDef.api_key_env_vars``, which ``auth._resolve_api_key_provider_secret``
+    and ``agent.client_lifecycle`` already walk in order, first usable value wins.
+
+    Order is preserved; blank entries and duplicates are dropped, so an empty first name falls
+    through to the second. A plain string yields a one-tuple, which is the pre-list behaviour.
+    Readers that can only name ONE variable (UI display, fingerprints, ``model.key_env`` carry-over)
+    use ``first_key_env`` — the first name — never ``str(value)``.
+    """
+    if isinstance(value, str):
+        candidates: tuple[Any, ...] = (value,)
+    elif isinstance(value, (list, tuple)):
+        candidates = tuple(value)
+    else:
+        return ()
+    names: list[str] = []
+    for item in candidates:
+        name = item.strip() if isinstance(item, str) else ""
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def first_key_env(value: Any) -> str:
+    """The single name to use where only one ``key_env`` can be honoured: ``""`` when none."""
+    names = provider_key_env_names(value)
+    return names[0] if names else ""
+
+
+def _user_pdef(pid: str, name: str, base_url: str, key_env: Any, transport: str = "openai_chat") -> ProviderDef:
+    """``source="user-config"`` ProviderDef shared by ``providers:`` and ``custom_providers:`` entries.
+
+    ``key_env`` is a name or an ordered list of names (``provider_key_env_names``); the whole chain
+    is kept, in order, on ``api_key_env_vars`` for the credential resolvers to walk.
+    """
+    return ProviderDef(id=pid, name=name, transport=transport, api_key_env_vars=provider_key_env_names(key_env),
                        base_url=base_url, is_aggregator=False, auth_type="api_key", source="user-config")
 
 
@@ -464,7 +502,7 @@ def resolve_custom_provider(name: str, custom_providers: Optional[list[dict[str,
             continue
         provider_key = (entry.get("provider_key") or "").strip()
         pdef = _user_pdef(custom_provider_slug(display_name, provider_key), display_name, api_url,
-                          (entry.get("key_env") or "").strip())
+                          entry.get("key_env") or entry.get("api_key_env") or "")
         if first_valid is None:
             first_valid = pdef
         if requested in custom_provider_aliases(display_name, provider_key):

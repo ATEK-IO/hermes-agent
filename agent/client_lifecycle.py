@@ -719,7 +719,9 @@ class ClientLifecycleMixin:
             except ImportError:
                 return None
             custom_provider = _get_named_custom_provider(getattr(self, "requested_provider", "") or "")
-            key_env = str((custom_provider or {}).get("key_env") or "").strip()
+            from hermes_cli.providers import first_key_env
+            # One env probe: a list ``key_env`` contributes its first name.
+            key_env = first_key_env((custom_provider or {}).get("key_env") or "")
             api_key = get_env_prefer_dotenv(key_env).strip() if key_env else ""
             if not custom_provider or not api_key:
                 return None

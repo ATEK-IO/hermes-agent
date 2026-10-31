@@ -4775,7 +4775,9 @@ def _named_custom_api_key(custom_entry: dict[str, Any], provider: str, custom_ba
     Aux resolves named custom providers here, not via _resolve_named_custom_runtime, so key_cmd must be
     honoured at the same precedence or every aux call 401s."""
     custom_key: Any = (custom_entry.get("api_key") or "").strip()
-    custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
+    from hermes_cli.providers import first_key_env
+    # ``_scoped_key_env`` resolves ONE name; a list ``key_env`` yields its first name.
+    custom_key_env = first_key_env(custom_entry.get("key_env") or custom_entry.get("api_key_env") or "")
     if not custom_key and custom_key_env:
         custom_key = _scoped_key_env(custom_key_env)
     custom_key_cmd = str(custom_entry.get("key_cmd", "") or "").strip()
