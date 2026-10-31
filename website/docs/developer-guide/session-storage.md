@@ -308,7 +308,7 @@ Multiple hermes processes (gateway + CLI sessions + worktree agents) share one
 
 - **Short SQLite timeout** (1 second) instead of the default 30s
 - **Time-budgeted application-level retry** with random jitter (20-150ms for the
-  first 2s, then 250ms-1s): 20s for routine writes, 60s for transcript writes
+  first 2s, then 250ms-1s): 60s for routine writes, 180s for transcript writes
   (their failure aborts the turn), 0.5s for observation-only activity writes
 - **BEGIN IMMEDIATE** transactions to surface lock contention at transaction start
 - **Periodic WAL checkpoints** every 50 successful writes (PASSIVE mode)
@@ -317,7 +317,7 @@ This avoids the "convoy effect" where SQLite's deterministic internal backoff
 causes all competing writers to retry at the same intervals.
 
 ```
-_WRITE_PATIENCE_S, _TRANSCRIPT_WRITE_PATIENCE_S, _ACTIVITY_WRITE_PATIENCE_S = 20.0, 60.0, 0.5
+_WRITE_PATIENCE_S, _TRANSCRIPT_WRITE_PATIENCE_S, _ACTIVITY_WRITE_PATIENCE_S = 60.0, 180.0, 0.5
 _WRITE_RETRY_MIN_S, _WRITE_RETRY_MAX_S = 0.020, 0.150
 _WRITE_RETRY_SLOW_MIN_S, _WRITE_RETRY_SLOW_MAX_S = 0.250, 1.000
 _CHECKPOINT_EVERY_N_WRITES = 50

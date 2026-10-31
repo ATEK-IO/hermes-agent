@@ -24,7 +24,7 @@ class _Agent:
         self._session_messages = [{"role": "user", "content": "hi"}]
         self._seen = seen
 
-    def _persist_session(self, _messages):
+    def _persist_session(self, _messages, **kwargs):
         self._seen.append(str(get_hermes_home()))
 
 @pytest.fixture

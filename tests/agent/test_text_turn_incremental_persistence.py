@@ -75,7 +75,7 @@ def _run_text_turn(agent, answer: str, *, flush_side_effect=None):
 
     events: list[tuple[str, object]] = []
 
-    def _record_flush(messages, conversation_history=None):
+    def _record_flush(messages, conversation_history=None, **kwargs):
         events.append((
             "flush",
             [

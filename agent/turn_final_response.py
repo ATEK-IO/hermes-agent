@@ -361,7 +361,7 @@ def finish_text_response(
     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
     # _persist_session idempotent). Failure must NOT abort the turn: finalize retries.
     try:
-        agent._flush_messages_to_session_db(messages, conversation_history)
+        agent._flush_messages_to_session_db(messages, conversation_history, queue_on_lock=True)
     except Exception:
         logger.warning(
             "final text-turn flush failed (session=%s) — reply is "
