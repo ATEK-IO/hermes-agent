@@ -405,7 +405,12 @@ def _db_flush_failed(agent, e: Exception, batch_rows: list[dict[str, Any]], adop
         if adoption_budget > 0 and _db_flush_adopt_compression_tip(agent):
             return "adopted"
         agent._compression_adoption_failed = True  # lets the turn explanation name rotation, not full-disk advice
-    logger.warning("Session DB append_message failed: %s", e)
+    # Loud on purpose: this failure aborts the turn (`session_persistence_failed`), so a
+    # WARNING buried among tool chatter is how a run ends without anyone noticing the
+    # transcript was lost (ATE-15509).
+    logger.error("Session DB append_message failed for %s (cause=%s): %s",
+                 getattr(agent, "session_id", None),
+                 getattr(agent, "_last_persistence_error_cause", None), e)
     return None
 
 

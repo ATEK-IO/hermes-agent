@@ -1326,3 +1326,25 @@ def _json_or(raw: Any, fallback: Any, warning: str) -> Any:
     except (json.JSONDecodeError, TypeError):
         logger.warning(warning)
         return fallback
+
+
+def abandon_open_transaction(conn) -> None:
+    """Roll back a transaction an interrupted statement left open on *conn*.
+
+    ``BEGIN IMMEDIATE`` can be interrupted *after* SQLite opened the transaction and
+    *before* the caller's ``try`` block is entered: CPython runs a signal handler as
+    soon as the C-level ``execute`` returns, so a soft interrupt (a new message
+    arriving mid-run) raises ``KeyboardInterrupt`` from the ``execute()`` line itself.
+    The transaction is then open with nobody owning it and the next write on that
+    connection — in production the turn-lease release in the teardown path — dies
+    with ``cannot start a transaction within a transaction``, which masks the
+    interrupt and drops the transcript batch (ATE-15509, T15 2026-10-31 12:58:21Z).
+
+    Safe to call when nothing is open (a ``BEGIN`` that never reached SQLite) and
+    around a commit that already landed. Never raises: this runs on the error path.
+    """
+    try:
+        if getattr(conn, "in_transaction", False):
+            conn.rollback()
+    except Exception:  # noqa: BLE001 - the caller is already unwinding a real error
+        logger.debug("rollback of an abandoned state.db transaction failed", exc_info=True)
