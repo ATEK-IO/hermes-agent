@@ -97,12 +97,52 @@ class TestBudgetWallIsTerminal:
         assert result.reason == FailoverReason.billing
         assert result.retryable is False
 
+    def test_budget_wall_declared_only_in_the_body_type_is_billing(self):
+        """LiteLLM's own ``type`` field is decisive even when the prose is generic.
+
+        The message is vendor-controlled and can be reworded, wrapped or replaced
+        by a proxy; ``type: budget_exceeded`` is the structured signal. Reading only
+        the prose made the verdict depend on a sentence — the same brittleness that
+        produced the original defect.
+        """
+        body = {
+            "error": {
+                "message": "Rate limit reached for key",
+                "type": "budget_exceeded",
+                "code": "429",
+            }
+        }
+        e = MockAPIError("Rate limit reached for key", status_code=429, body=body)
+
+        result = classify_api_error(e, provider="custom")
+
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is False
+
 
 class TestRateLimitGuard:
     """A generic provider rate limit must still retry — the fix must not overreach."""
 
     def test_generic_429_rate_limit_still_retries(self):
         e = MockAPIError("Rate limit exceeded: too many requests", status_code=429)
+
+        result = classify_api_error(e, provider="custom")
+
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+
+    def test_body_type_rate_limit_error_still_retries(self):
+        """A structured ``rate_limit_error`` type must not be read as a budget wall."""
+        body = {
+            "error": {
+                "message": "Rate limit reached for key",
+                "type": "rate_limit_error",
+                "code": "429",
+            }
+        }
+        e = MockAPIError("Rate limit reached for key", status_code=429, body=body)
 
         result = classify_api_error(e, provider="custom")
 

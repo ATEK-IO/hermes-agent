@@ -1074,6 +1074,28 @@ def _status_404(c: _Ctx) -> Verdict:
     return _V_MODEL_NOT_FOUND if _model_id_missing_known_prefix(c.model_slug, c.provider_slug) else _V_UNKNOWN
 
 
+def _body_declares_budget_wall(body: Any) -> bool:
+    """True when the vendor's own body fields say the budget is spent.
+
+    LiteLLM stamps ``type: budget_exceeded`` (and ``code: 429``) on the wall. The
+    prose is vendor-controlled and may be reworded or overridden by a wrapper, so
+    reading the structured ``type`` as well as the message keeps the verdict on
+    the vendor's vocabulary instead of on a sentence (ATE-4494: a 429 carrying
+    only the type still retried three times per call and burned the run).
+    Deliberately narrow: only the budget vocabulary matches, so ``rate_limit_error``
+    and friends are untouched.
+    """
+    if not isinstance(body, dict):
+        return False
+    err = body.get("error")
+    obj = err if isinstance(err, dict) else body
+    for key in ("type", "code", "param"):
+        value = obj.get(key)
+        if isinstance(value, str) and any(p in value.lower() for p in _BUDGET_EXHAUSTED_PATTERNS):
+            return True
+    return False
+
+
 def _status_429(c: _Ctx) -> Verdict:
     # A structured billing code is decisive: LiteLLM stamps
     # ``terminal_quota_exhausted`` (a hard cap, not throttling) on 429s, and
@@ -1086,7 +1108,7 @@ def _status_429(c: _Ctx) -> Verdict:
     # retry budget on a condition no retry can clear (ATE-4494 measured ~470
     # runs/3 h retrying into a dead budget). Billing verdict ⇒ non-retryable,
     # no pool rotation, straight to the terminal path that records the cap.
-    if any(p in c.msg for p in _BUDGET_EXHAUSTED_PATTERNS):
+    if any(p in c.msg for p in _BUDGET_EXHAUSTED_PATTERNS) or _body_declares_budget_wall(c.body):
         reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
         if reset is None and any(p in c.msg.lower() for p in _BUDGET_RESET_SOON_PATTERNS):
             # A windowed (daily/hourly) budget resets at a known boundary: allow
