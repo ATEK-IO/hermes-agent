@@ -458,9 +458,12 @@ class SessionMessagesMixin:
     def append_messages_batch(
         self, session_id: str, messages: list[dict[str, Any]], compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, chunk_rows: Optional[int] = None,
-        turn_lease_ttl_seconds: float = 300.0) -> int:
+        turn_lease_ttl_seconds: float = 300.0, patience_s: Optional[float] = None) -> int:
         """Append *messages* in ONE write txn (all rows land or none, guards run once); returns the inserted
-        count. ``chunk_rows`` bounds txn size for LARGE copies (branch seeds; FTS triggers run per row)."""
+        count. ``chunk_rows`` bounds txn size for LARGE copies (branch seeds; FTS triggers run per row).
+        ``patience_s`` overrides the transcript busy-wait for one call: the turn-end retry queue uses a
+        short per-attempt patience because it owns the waiting across attempts (see
+        ``agent.session_persistence._LockRetryQueue``)."""
         if not messages:
             return 0
         if chunk_rows is not None and len(messages) > chunk_rows:
@@ -469,7 +472,7 @@ class SessionMessagesMixin:
                 self._stamp_tool_call_uids(msg, _parse_tool_calls(msg.get("tool_calls")), tool_uid_index)
             return sum(self.append_messages_batch(session_id, messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
-                    turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+                    turn_lease_ttl_seconds=turn_lease_ttl_seconds, patience_s=patience_s)
                 for start in range(0, len(messages), chunk_rows))
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
@@ -489,7 +492,9 @@ class SessionMessagesMixin:
             inserted, tool_calls_total = self._insert_message_rows(conn, session_id, inserted_rows)
             self._bump_session_counters(conn, session_id, inserted, tool_calls_total, unit=False)
             return inserted
-        return self._execute_transcript_write(_do, messages, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        return self._execute_transcript_write(
+            _do, messages,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S if patience_s is None else patience_s)
 
     _ROW_STATE_KEYS = ("_row_id", DB_ROW_SNAPSHOT, "timestamp")
 

@@ -246,3 +246,38 @@ def test_interrupt_turn_only_while_active():
     assert calls == ["lost"] and lease.interrupt_message == "lost"
     lease.deactivate_after_liveness_abort()
     assert lease.stop.is_set() and lease.is_turn_active() is False
+
+
+def test_refresh_write_patience_tracks_the_session_write_budget():
+    """A renewal waits for the write lock as long as a routine state.db write does.
+
+    The constant is pinned, not imported: importing ``hermes_state`` here would close an import
+    cycle (``hermes_state`` -> ``hermes_state_common`` -> ``agent.*``), so this test is the drift
+    guard. Raise ``SessionDB``'s routine-write budget without raising the renewal's and it fails.
+    Card: ATE-9344 (ATE-6902 F1, ATE-6800 follow-up).
+    """
+    from hermes_state import SessionDB
+    from agent import turn_facade_lease
+
+    assert turn_facade_lease._REFRESH_WRITE_PATIENCE_S == SessionDB._WRITE_PATIENCE_S
+
+
+def test_refresh_tick_spends_the_routine_write_budget_and_still_honours_the_authority():
+    """The renewal hands the store that budget, not the old 20 s, and the remaining authority still
+    wins when it is smaller (``min()`` on the call site). Card: ATE-9344 (ATE-6902 F1, ATE-6800 follow-up)."""
+    from agent import turn_facade_lease
+
+    db = _Db()
+    seen = []
+    db.refresh_session_turn_lease = lambda session_id, holder, **kw: seen.append(kw) or True
+    lease, calls = _active_lease(db)
+
+    assert lease.refresh_tick() is None
+    assert calls == []
+    assert seen[-1]["patience_s"] == turn_facade_lease._REFRESH_WRITE_PATIENCE_S
+    assert seen[-1]["patience_s"] >= 60.0
+
+    # 10 s of authority left, 2 s expiry margin: the deadline, not the budget, bounds the wait.
+    lease._authority_deadline = time.time() + 10.0
+    assert lease.refresh_tick() is None
+    assert 6.0 <= seen[-1]["patience_s"] <= 8.0

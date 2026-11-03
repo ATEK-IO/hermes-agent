@@ -49,7 +49,9 @@ def _flush_session_messages(session: dict | None) -> bool:
     # worker whose whole budget is 5s — one slow source silently lost the transcript.
     try:
         with _session_profile_runtime_scope(session or {}, hydrate_secrets=False):
-            agent._persist_session(snapshot)
+            # queue_on_lock=False: every caller (exit flush, SIGTERM handler, idle reaper) is a thread whose
+            # result must be durable when it returns — a daemon-thread batch is not. Wait, do not park.
+            agent._persist_session(snapshot, queue_on_lock=False)
         return True
     except Exception:
         logger.debug("incremental session flush failed", exc_info=True)

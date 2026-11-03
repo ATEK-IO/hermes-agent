@@ -375,7 +375,9 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     # the flush would treat every message as durable and skip it — data loss when finalize is the sole persist path.
     if hasattr(agent, "_persist_session") and (snapshot := getattr(agent, "_session_messages", None)):
         with contextlib.suppress(Exception):
-            agent._persist_session(snapshot)
+            # queue_on_lock=False: this is the shutdown/exit flush. A batch parked on the retry queue's
+            # daemon worker dies with the interpreter, so wait the lock out (bounded, as before the queue).
+            agent._persist_session(snapshot, queue_on_lock=False)
     # interrupted=True so crash-recovery plugins can flush state (mirrors cli.py atexit). The end-of-session
     # hooks and the memory commit read the provider's config/credentials at call time; every caller of this
     # chokepoint is an unscoped reaper/Timer/atexit/pool thread, so bind the SESSION's profile here — unscoped

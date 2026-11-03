@@ -25,8 +25,12 @@ _REASON_LEASE_LOST = "session turn lease lost"
 
 LEASE_TTL_SECONDS = 300.0
 LEASE_WAIT_SECONDS = 1800.0
-# SessionDB's default write patience: a renewal waits this long for the write lock, never past the authority.
-_REFRESH_WRITE_PATIENCE_S = 20.0
+# A renewal waits for the write lock as long as a routine ``state.db`` write does
+# (``SessionDB._WRITE_PATIENCE_S``, 60 s). The old 20 s sat inside the measured lock-wait tail
+# (p95 4.5-13.2 s, max 44.1 s on routine writes), so a renewal on a busy store gave up while the
+# turn was still healthy. ``min()`` at the call site bounds it by the remaining authority, so a
+# renewal can never outlive the row; the equality is pinned by tests/agent/test_turn_facade_lease.py.
+_REFRESH_WRITE_PATIENCE_S = 60.0
 # Headroom before expiry for one BEGIN IMMEDIATE blocked in the writer's 1s busy handler, plus jitter.
 _REFRESH_EXPIRY_MARGIN_S = 2.0
 
