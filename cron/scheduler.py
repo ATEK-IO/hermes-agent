@@ -3301,6 +3301,34 @@ def _start_owned_run(job: dict, execution_id: str) -> Optional[contextvars.Token
     return enter_cron_execution(job, execution_id, record or {})
 
 
+def _bind_cron_llm_identity(job: dict, execution_id: str) -> None:
+    """Name the firing job's LLM spend, so a cron call never ships an unexpanded placeholder.
+
+    ATE-17136. ``~/.hermes/config.yaml`` sends ``x-paperclip-agent: "${env:PAPERCLIP_AGENT_ID}"``
+    and the LiteLLM gateway books ``end_user`` from that header. Under ``gateway.multiplex_profiles``
+    every config env read inside a turn goes through the fire's secret scope, and a scope miss never
+    falls back to ``os.environ`` (agent/secret_scope.py:get_secret) — so a cron fire, which has no
+    Paperclip run behind it, kept the literal ``${env:PAPERCLIP_AGENT_ID}`` and every cron LLM call
+    was booked to a placeholder: 532 rows by 2026-11-04, all from cron sessions, invisible to
+    litellm-cost-sync. The ATE-12818 drop-in on hermes-gateway.service sets the variable on the
+    process, which multiplex semantics correctly refuse to read.
+
+    Seed the scope with a stable per-job identity instead. Never overwrites a value the profile
+    already defines, and never raises: naming spend must not stop a job.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope
+
+        scope = current_secret_scope()
+        if not isinstance(scope, dict):
+            return
+        job_id = str(job.get("id") or "unknown")
+        scope.setdefault("PAPERCLIP_AGENT_ID", f"cron:{job_id}")
+        scope.setdefault("PAPERCLIP_RUN_ID", f"cron:{job_id}:{execution_id}")
+    except Exception:  # naming spend must never break a fire
+        logger.debug("cron LLM identity bind skipped", exc_info=True)
+
+
 def _run_one_job_body(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
@@ -3328,6 +3356,8 @@ def _run_one_job_body(
         # including the crash notice in the except below when claim_dispatch or
         # mark_execution_running raises, so install it before either.
         _fire_scope_tokens = _install_fire_secret_scope()
+        # ATE-17136: give this fire a real LLM identity before any call ships it.
+        _bind_cron_llm_identity(job, execution_id)
         # Commit a finite one-shot's dispatch BEFORE its side effect so a tick dying mid-run cannot
         # re-fire it forever on restart. No-op for recurring/infinite jobs (at-most-times).
         # This lives here in the shared body so BOTH the built-in ticker and the external provider (Chronos
