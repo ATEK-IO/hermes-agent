@@ -2526,6 +2526,16 @@ def _read_main_api_key_if_same_origin(aux_base_url: str) -> str | Callable[[], s
     return _read_main_api_key()
 
 
+def endpoint_api_key_if_same_origin(base_url: str) -> str | Callable[[], str]:
+    """Public name for the same-origin credential reader: the live turn's key for *base_url*, else "".
+
+    For in-process consumers outside this module that must authenticate an **inspection** call to the
+    endpoint the turn is already using (e.g. the pricing catalogue behind a cost breakdown). Same
+    guarantee as the private reader: an origin mismatch returns "", never another host's credential.
+    """
+    return _read_main_api_key_if_same_origin(base_url)
+
+
 # Compatibility mirrors for older readers/tests; the ContextVar below is
 # authoritative (overlapping gateway sessions make a process-global unsafe).
 _RUNTIME_MAIN_PROVIDER: str = ""

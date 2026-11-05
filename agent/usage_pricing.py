@@ -556,6 +556,30 @@ def _models_dev_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
     )
 
 
+def resolve_endpoint_api_key(base_url: Optional[str]) -> Any:
+    """The live turn's credential for *base_url*, or "" when this is a different origin.
+
+    Pricing needs the provider key for ONE thing: reading the endpoint's live ``/models`` catalogue
+    (``get_pricing_entry`` -> ``fetch_endpoint_model_metadata``). Without it a keyed gateway answers 401,
+    the catalogue comes back empty and every rate - so every per-type cost component - silently
+    disappears from the breakdown. Borrowed through ``agent.auxiliary_client``'s same-origin reader,
+    which returns "" unless *base_url* is the exact origin of the endpoint the turn is already using, so
+    one provider's key is never sent to another provider's host. A callable credential (rotating/OAuth
+    token) is returned unchanged and materialized at probe time by ``_auth_headers``.
+
+    Best-effort by design: any failure returns "", leaving the old keyless (pricing-degraded) behavior.
+    """
+    if not base_url:
+        return ""
+    try:
+        from agent.auxiliary_client import endpoint_api_key_if_same_origin
+
+        return endpoint_api_key_if_same_origin(str(base_url))
+    except Exception:
+        logger.debug("Endpoint credential resolution failed for %s", base_url, exc_info=True)
+        return ""
+
+
 def get_pricing_entry(
     model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None,
     api_key: Optional[str] = None,
