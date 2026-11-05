@@ -32,6 +32,7 @@ from hermes_state_common import (
     TITLE_SOURCE_USER as _TITLE_SOURCE_USER,
     escape_like as _escape_like, _placeholders,
     stat_db_file_identity as _stat_db_file_identity,
+    abandon_open_transaction,
 )
 from hermes_state_holders import read_only_db_uri
 from hermes_state_pidns import holder_pid_checkable
@@ -1029,16 +1030,19 @@ class SessionDB(
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
                     try:
+                        # BEGIN IMMEDIATE is inside this try on purpose: an interrupt
+                        # delivered as the statement returns (a soft interrupt — a new
+                        # message mid-run) leaves the transaction OPEN at the SQLite
+                        # level although Python never entered the callback, and the next
+                        # write on this connection then fails with "cannot start a
+                        # transaction within a transaction" (ATE-15509).
+                        self._conn.execute("BEGIN IMMEDIATE")
                         fn_started = True
                         result = fn(self._conn)
                         self._conn.commit()
                     except BaseException:
-                        try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
+                        abandon_open_transaction(self._conn)
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1

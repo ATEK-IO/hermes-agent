@@ -11,7 +11,7 @@ from typing import Sequence
 
 from hermes_constants import get_hermes_home
 from hermes_state_common import (FTS_CJK_STALE_KEY, FTS_STALE_KEY, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS,
-    routed_sessions_setting)
+    routed_sessions_setting, abandon_open_transaction)
 from hermes_state_errors import is_fts_scoped_corruption_error, is_sqlite_lock_error
 
 # caplog tests pin the "hermes_state" logger name.
@@ -377,8 +377,8 @@ class SessionFtsSetupMixin:
                     self._raise_if_db_replaced()
                     if self._conn is None:
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
                     try:
+                        self._conn.execute("BEGIN IMMEDIATE")
                         self._conn.execute(
                             "INSERT INTO state_meta (key, value) VALUES (?, '1') "
                             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -399,7 +399,7 @@ class SessionFtsSetupMixin:
                         self._drop_all_fts_triggers(self._conn.cursor())
                         self._conn.commit()
                     except BaseException:
-                        self._conn.rollback()
+                        abandon_open_transaction(self._conn)
                         raise
                 break
             except sqlite3.Error as detach_exc:
