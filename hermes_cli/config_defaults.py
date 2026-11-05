@@ -2307,6 +2307,14 @@ DEFAULT_CONFIG = {
         # index matches instead of LIKE scans. True = use when present (inert otherwise); False =
         # never load/serve it. Bridged to HERMES_CJK_FTS.
         "cjk_fts": True,
+        # Trigram FTS family (messages_fts_trigram) over every message. It serves CJK queries on
+        # hosts without the cjk_unicode61 extension and non-prefix substring queries, and its
+        # incremental merge runs inside the single SQLite write lock — on a fleet store it is the
+        # largest index and the dominant cost of the longest lock holds. True = create and maintain
+        # it (today's behaviour). False = do not create it, drop an existing family once at schema
+        # ensure without a rebuild (no scan of messages), and route those queries to the LIKE scan.
+        # Bridged to HERMES_FTS_TRIGRAM.
+        "fts_trigram": True,
         # Slow session-search threshold (ms): searches at/above it log one INFO line with the
         # routing path (fts_cjk / fts5 / trigram / like_scan). 0 logs every search. Bridged to
         # HERMES_SEARCH_SLOW_MS.
