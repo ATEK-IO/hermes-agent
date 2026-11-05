@@ -566,8 +566,13 @@ def _entry_api_mode(entry: dict) -> str | None:
 
 
 def _entry_credentials(entry: dict, *key_env_keys: str) -> tuple[Any, str, str]:
-    """Unminted credential, env fallback, and stable grouping identity."""
-    key_env = str(next((entry.get(k) for k in key_env_keys if entry.get(k)), "")).strip()
+    """Unminted credential, env fallback, and stable grouping identity.
+
+    ``key_env`` may be an ordered list (a credential chain); one name is all this row can carry,
+    so its FIRST name is used and ``str(['A', 'B'])`` never becomes an identity or a lookup key.
+    """
+    from hermes_cli.providers import first_key_env
+    key_env = first_key_env(next((entry.get(k) for k in key_env_keys if entry.get(k)), ""))
     source = build_command_token_provider(entry.get("key_cmd", ""), entry.get("name") or "custom")
     if source is not None:
         return source, key_env, source.cache_identity

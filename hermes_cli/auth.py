@@ -370,7 +370,10 @@ def _model_level_key_env(provider_id: str) -> str:
         return ""
     if str(model_cfg.get("provider") or "").strip().lower() != provider_id:
         return ""
-    return str(model_cfg.get("key_env") or model_cfg.get("api_key_env") or "").strip()
+    from hermes_cli.providers import first_key_env
+    # ``model.key_env`` takes one name; a list is tolerated and its first name is used, so a
+    # chain copied into the pointer never resolves as ``str(['A', 'B'])``.
+    return first_key_env(model_cfg.get("key_env") or model_cfg.get("api_key_env") or "")
 
 
 def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) -> tuple[str, str]:

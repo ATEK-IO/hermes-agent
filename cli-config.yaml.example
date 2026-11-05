@@ -200,6 +200,21 @@ model:
 #     # api_mode auto-detected as codex_responses for api.meta.ai; no need to set
 #     # (the bundled meta-ai provider covers this — a named custom provider is
 #     # only needed for a non-default Meta-compatible endpoint)
+# Credential chain (optional): `key_env` as an ordered list.
+# `key_env` names one env var by default — looked up in `.env` first, then in this process's
+# own environment. It also takes an ORDERED LIST: the names are tried left to right and the
+# first one that holds a value wins, so one entry can read an agent's own key in an agent run
+# and a shared key in the gateway, a cron job or the CLI. A name that is defined in no `.env`
+# file simply falls through to the next one; an empty entry is skipped the same way.
+#
+# providers:
+#   my-gateway:
+#     base_url: https://gateway.example.com/v1
+#     key_env: [MY_AGENT_KEY, MY_SHARED_KEY]   # agent key first, shared key second
+#     # a plain string (`key_env: MY_SHARED_KEY`) behaves exactly as before, and the
+#     # settings UI, the model picker and `model.key_env` keep using the FIRST name.
+#     # The order is walked by the resolver that builds the provider client, so a
+#     # gateway/cron/CLI run with no agent key uses MY_SHARED_KEY, never a placeholder.
 # Fast/priority tier behind an OpenAI-compatible gateway or proxy: agent.service_tier
 # (`/fast`) only reaches first-party endpoints; ask a gateway for its own tier via
 # extra_body, which is merged into every request routed to that provider.

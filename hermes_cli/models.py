@@ -2003,7 +2003,10 @@ def _credential_fingerprint(provider: str) -> str:
 
     if provider == "ollama":
         provider_cfg = _get_provider_config_dict("ollama")
-        key_env = provider_cfg.get("key_env") or provider_cfg.get("api_key_env") or ""
+        from hermes_cli.providers import first_key_env
+        # Fingerprint only: a list ``key_env`` is reported as its first name, and the env probe
+        # below is never handed a list (``os.environ.get(list)`` would raise).
+        key_env = first_key_env(provider_cfg.get("key_env") or provider_cfg.get("api_key_env") or "")
         model_cfg = _get_model_config_dict()
         parts += [
             f"OLLAMA_HOST={os.environ.get('OLLAMA_HOST', '')}",

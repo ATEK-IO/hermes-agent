@@ -236,8 +236,17 @@ def _normalize_custom_provider_entry(
 
     _put("api_key", _stripped("api_key"))
     _put("key_cmd", _stripped("key_cmd"))
-    key_env = _stripped("key_env", "api_key_env")
+    # ``key_env`` takes a name OR an ordered list. ``key_env`` keeps the first name (the one
+    # variable that fits where a single name is read) and the whole chain rides on
+    # ``api_key_env_vars`` so a resolver can walk it in order — ``_stripped`` alone would drop a
+    # list on the floor and lose the fallback rung entirely.
+    from hermes_cli.providers import provider_key_env_names
+
+    key_env_names = provider_key_env_names(entry.get("key_env") or entry.get("api_key_env") or "")
+    key_env = key_env_names[0] if key_env_names else ""
     _put("key_env", key_env)
+    if len(key_env_names) > 1:
+        normalized["api_key_env_vars"] = key_env_names
     if key_env and entry.get("api_key_env") and not entry.get("key_env"):
         normalized["api_key_env"] = key_env
     api_mode = _stripped("api_mode", "transport")
@@ -298,6 +307,10 @@ def _custom_provider_entry_to_provider_config(
             provider_entry[field] = normalized[field]
     if "model" in normalized:
         provider_entry["default_model"] = normalized["model"]
+    if normalized.get("api_key_env_vars"):
+        # Back to the v12 shape that accepts the list: the chain is the whole point, so a
+        # round-trip must not keep only the first rung.
+        provider_entry["key_env"] = list(normalized["api_key_env_vars"])
     if "api_mode" in normalized:
         provider_entry["transport"] = normalized["api_mode"]
     return provider_entry

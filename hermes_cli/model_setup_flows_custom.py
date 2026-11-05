@@ -12,7 +12,7 @@ import os
 import urllib.parse
 
 from hermes_cli.cli_output import line_input
-from hermes_cli.providers import custom_provider_slug
+from hermes_cli.providers import custom_provider_slug, provider_key_env_names
 from hermes_cli.model_setup_flows_common import (
     _HTTP, _ask, _commit_model_config, _load_config_model_section,
     _prune_replaced_custom_model_config_credentials, _radiolist, _say)
@@ -425,7 +425,7 @@ def _model_flow_named_custom(config, provider_info):
             )
             if had_inline_api_key and config_api_key and not str(provider_entry.get("api_key", "") or "").strip():
                 provider_entry["api_key"] = config_api_key
-            if key_env and not str(provider_entry.get("key_env", "") or "").strip():
+            if key_env and not provider_key_env_names(provider_entry.get("key_env") or ""):
                 provider_entry["key_env"] = key_env
             cfg["providers"] = providers_cfg
             save_config(cfg)
