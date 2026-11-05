@@ -38,6 +38,7 @@ from tools.approval_floors import (
 from tools.approval_gateway_wait import _await_gateway_decision
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
 from tools.approval_smart import _smart_verdict
+from tools.scan_guard import recursive_scan_block_result, recursive_scan_reason
 
 logger = logging.getLogger(__name__)
 
@@ -1046,8 +1047,10 @@ def _user_deny_block(command: str) -> dict | None:
 def _floor_block(command: str, *, sudo_guard: bool = False) -> dict | None:
     """Unconditional floors, BEFORE yolo / mode=off / cron approve-mode so no
     session-level setting can bypass them: hardline catastrophic commands,
-    password-piping to ``sudo -S`` with no SUDO_PASSWORD configured (full guard
-    only), the user's own approvals.deny rules ("never, even under yolo"), and
+    a recursive scan of a whole machine tree (approvals.deny globs cannot
+    express it — see tools/scan_guard.py), password-piping to ``sudo -S`` with
+    no SUDO_PASSWORD configured (full guard only), the user's own
+    approvals.deny rules ("never, even under yolo"), and
     deletion of the Python interpreter/venv this very runtime boots from (a
     delete the agent cannot walk back — the next start fails before any tool
     can run, #58748)."""
@@ -1057,6 +1060,10 @@ def _floor_block(command: str, *, sudo_guard: bool = False) -> dict | None:
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc, command)
+    scan_reason = recursive_scan_reason(command)
+    if scan_reason:
+        logger.warning("Recursive scan block: %s (command: %s)", scan_reason, command[:200])
+        return recursive_scan_block_result(scan_reason)
     runtime_target = command_deletes_runtime(command)
     if runtime_target:
         logger.warning("Runtime self-delete block: %s (command: %s)", runtime_target, command[:200])
