@@ -183,9 +183,10 @@ def busy_entries(scratch_root: Path) -> set[Path]:
             continue
         if not cwd or cwd.endswith(" (deleted)"):
             continue
-        cwd_path = os.path.realpath(cwd)
+        cwd_path = os.path.abspath(cwd)
         if not _under(cwd_path, root):
             continue
+        cwd_path = os.path.realpath(cwd_path)
         relative = os.path.relpath(cwd_path, root)
         if relative == os.curdir:
             continue
