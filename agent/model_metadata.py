@@ -83,6 +83,15 @@ _endpoint_probe_path_cache: dict[str, tuple] = {}
 # a full connect timeout, later probes short-circuit for a while.
 _ENDPOINT_BLACKHOLE_TTL_SECONDS = 30.0
 _endpoint_blackhole_cache: dict[str, float] = {}  # host:port -> monotonic ts
+# An UNAUTHENTICATED catalogue probe that a keyed endpoint refused (401/403) is a verdict about the
+# CALLER, not about the host: the endpoint is right to refuse, the body can never be read, and repeating
+# the request every memo window (5 min) writes an "unauthorized" line into the operator's access log
+# forever. Keyed probes keep their own window, so a genuine credential fault is still detected on the
+# next probe within seconds. Longer than ``_ENDPOINT_MODEL_CACHE_TTL`` so the repeat is actually
+# suppressed and short enough that an endpoint which starts accepting anonymous calls recovers within
+# the hour without a restart.
+_ENDPOINT_UNAUTH_PROBE_TTL_SECONDS = 3600.0
+_endpoint_unauth_probe_cache: dict[str, float] = {}  # host:port -> monotonic ts (keyless probes only)
 
 
 def _parse_base_url(base_url: str, scheme: str = "http"):
@@ -104,26 +113,53 @@ def _endpoint_host_key(base_url: str) -> Optional[str]:
         return None
 
 
+def _blackhole_record(cache: dict[str, float], ttl: float, base_url: str, reason: str) -> None:
+    """Record ``base_url``'s host:port in *cache* so probes skip it for *ttl* seconds."""
+    key = _endpoint_host_key(base_url)
+    if key is not None and ttl > 0:
+        cache[key] = time.monotonic()
+        logger.debug("Endpoint %s %s — skipping further probes for %.0fs", key, reason, ttl)
+
+
+def _blackholed(cache: dict[str, float], ttl: float, base_url: str) -> bool:
+    """True while *cache* holds a live (< *ttl* seconds) entry for ``base_url``'s host:port."""
+    if ttl <= 0:
+        return False
+    key = _endpoint_host_key(base_url)
+    if key is None:
+        return False
+    seen = cache.get(key)
+    if seen is None:
+        return False
+    if (time.monotonic() - seen) >= ttl:
+        del cache[key]
+        return False
+    return True
+
+
 def _note_endpoint_blackholed(base_url: str) -> None:
     """Record that a probe to ``base_url`` timed out during TCP connect."""
-    key = _endpoint_host_key(base_url)
-    if key is not None:
-        _endpoint_blackhole_cache[key] = time.monotonic()
-        logger.debug("Endpoint %s timed out connecting — skipping further probes for %.0fs", key, _ENDPOINT_BLACKHOLE_TTL_SECONDS)
+    _blackhole_record(_endpoint_blackhole_cache, _ENDPOINT_BLACKHOLE_TTL_SECONDS, base_url, "timed out connecting")
 
 
 def _endpoint_blackholed(base_url: str) -> bool:
     """True if a recent probe to ``base_url`` timed out during TCP connect (cache lookup only)."""
-    if _ENDPOINT_BLACKHOLE_TTL_SECONDS <= 0:
-        return False
-    key = _endpoint_host_key(base_url)
-    seen = _endpoint_blackhole_cache.get(key) if key is not None else None
-    if seen is None:
-        return False
-    if (time.monotonic() - seen) >= _ENDPOINT_BLACKHOLE_TTL_SECONDS:
-        del _endpoint_blackhole_cache[key]
-        return False
-    return True
+    return _blackholed(_endpoint_blackhole_cache, _ENDPOINT_BLACKHOLE_TTL_SECONDS, base_url)
+
+
+def _note_endpoint_unauth_probe_refused(base_url: str) -> None:
+    """Record that a KEYLESS ``/models`` probe to ``base_url`` was refused (401/403).
+
+    Host-keyed, so every keyless caller for one server shares the entry, and deliberately separate from
+    the connect-timeout cache: a keyed caller must keep probing untouched.
+    """
+    _blackhole_record(_endpoint_unauth_probe_cache, _ENDPOINT_UNAUTH_PROBE_TTL_SECONDS, base_url, "refused an unauthenticated /models probe")
+
+
+def _endpoint_unauth_probe_refused(base_url: str) -> bool:
+    """True if a keyless ``/models`` probe to ``base_url`` was refused recently (cache lookup only)."""
+    return _blackholed(_endpoint_unauth_probe_cache, _ENDPOINT_UNAUTH_PROBE_TTL_SECONDS, base_url)
+
 
 
 def _note_if_connect_timeout(exc: BaseException, base_url: str) -> None:
@@ -1041,6 +1077,10 @@ def fetch_endpoint_model_metadata(base_url: str, api_key: str = "", force_refres
     # Blackholed: return empty WITHOUT caching so it is retried once the entry expires.
     if _endpoint_blackholed(normalized):
         return {}
+    # A keyless probe this server already refused doesn't get repeated: the key is what was missing, and
+    # only a keyed caller can change that answer. Keyed callers never consult this entry.
+    if not api_key and _endpoint_unauth_probe_refused(normalized):
+        return {}
     alternate = normalized[:-3].rstrip("/") if normalized.endswith("/v1") else normalized + "/v1"
     candidates = [normalized] + ([alternate] if alternate != normalized else [])
     headers = _auth_headers(api_key)
@@ -1064,6 +1104,9 @@ def fetch_endpoint_model_metadata(base_url: str, api_key: str = "", force_refres
             with model_metadata_http.stream(url, headers=headers, timeout=(5, 10), verify=verify) as response:
                 if response.status_code in (401, 403):
                     logger.debug("Model metadata probe received HTTP %s from %s; stopping candidate probing", response.status_code, url)
+                    if not api_key:
+                        # Keyless: this answer cannot change until a key arrives, so stop repeating it.
+                        _note_endpoint_unauth_probe_refused(normalized)
                     break
                 response.raise_for_status()
                 response.read()

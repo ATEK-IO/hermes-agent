@@ -491,22 +491,30 @@ def _serialize_assistant_message(message: Any) -> dict[str, Any]:
 
 
 def _canonical_usage_and_cost(canonical: Any, *, provider: str, model: str,
-                              base_url: str) -> tuple[dict[str, int], dict[str, float]]:
-    """Translate canonical Hermes usage into Langfuse usage and cost maps."""
+                              base_url: str, api_key: Any = None) -> tuple[dict[str, int], dict[str, float]]:
+    """Translate canonical Hermes usage into Langfuse usage and cost maps.
+
+    ``api_key`` is the provider credential the traced request itself used; when omitted it is resolved
+    from the live turn for ``base_url`` (same origin only). Pricing reads the endpoint's ``/models``
+    catalogue, so a keyless lookup against a keyed gateway returns no rates at all: the total survives
+    but every per-type component silently stays empty.
+    """
     usage_details: dict[str, int] = {
         key: tokens for key, attr, _ in _USAGE_FIELDS
         if (tokens := getattr(canonical, attr)) or key in ("input", "output")
     }
     cost_details: dict[str, float] = {}
     try:
-        from agent.usage_pricing import estimate_usage_cost, resolve_billing_route
+        from agent.usage_pricing import estimate_usage_cost, resolve_billing_route, resolve_endpoint_api_key
 
         # Subscription-included routes: Langfuse treats explicit cost_details
         # (even zeros) as authoritative, so omit them and let it estimate.
         route = resolve_billing_route(model, provider=provider, base_url=base_url)
         if getattr(route, "billing_mode", "") == "subscription_included":
             return usage_details, cost_details
-        cost = estimate_usage_cost(model, canonical, provider=provider, base_url=base_url, api_key="")
+        if api_key is None:
+            api_key = resolve_endpoint_api_key(base_url)
+        cost = estimate_usage_cost(model, canonical, provider=provider, base_url=base_url, api_key=api_key)
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"usage pricing failed: {exc}")
         return usage_details, cost_details
@@ -528,7 +536,7 @@ def _canonical_usage_and_cost(canonical: Any, *, provider: str, model: str,
 
         from agent.usage_pricing import get_pricing_entry
 
-        entry = get_pricing_entry(model, provider=provider, base_url=base_url)
+        entry = get_pricing_entry(model, provider=provider, base_url=base_url, api_key=api_key)
         for key, attr, rate_attr in _USAGE_FIELDS if entry else ():
             rate = getattr(entry, rate_attr, None) if rate_attr else None
             tokens = getattr(canonical, attr)

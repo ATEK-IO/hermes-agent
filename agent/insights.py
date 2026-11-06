@@ -9,7 +9,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, format_cost_label, format_duration_compact, has_known_pricing
+from agent.usage_pricing import (CanonicalUsage, estimate_usage_cost, format_cost_label, format_duration_compact,
+                                 has_known_pricing, resolve_endpoint_api_key)
 from hermes_cli.timefmt import coerce_epoch
 from hermes_time import safe_strftime
 import itertools
@@ -38,7 +39,8 @@ def _estimate_cost(session_or_model: dict[str, Any] | str, input_tokens: int = 0
     else:
         model = session_or_model or ""
         usage = CanonicalUsage(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
-    result = estimate_usage_cost(model, usage, provider=provider, base_url=base_url)
+    result = estimate_usage_cost(model, usage, provider=provider, base_url=base_url,
+                                 api_key=resolve_endpoint_api_key(base_url))
     return float(result.amount_usd or 0.0), result.status
 
 

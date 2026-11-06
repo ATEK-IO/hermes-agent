@@ -2526,6 +2526,67 @@ def _read_main_api_key_if_same_origin(aux_base_url: str) -> str | Callable[[], s
     return _read_main_api_key()
 
 
+_CONFIG_PROVIDER_KEY_TTL_SECONDS = 300.0
+# origin -> (monotonic ts, credential); credentials only, never a URL, so a stale entry cannot
+# redirect a key — it can only keep serving or stop serving the same origin's own credential.
+_config_provider_key_cache: dict[tuple[str, str, int], tuple[float, Any]] = {}
+
+
+def endpoint_api_key_from_config_provider(base_url: str) -> Any:
+    """Credential of the **config-declared** provider whose ``base_url`` is this exact origin.
+
+    Companion to ``_read_main_api_key_if_same_origin`` for the contexts where no turn has bound a live
+    runtime yet (a fresh worker process computing a cost, a background flush). It reads one provider
+    entry and pairs *that entry's* base_url with *that entry's* credential — the same single-source rule
+    the live reader follows — so it can never pair one host's URL with another's key. Every credential
+    form the main client honours is honoured here (inline ``api_key``, ``key_env`` through the profile
+    secret scope, ``key_cmd``/credential pool via ``_named_custom_api_key``), and the placeholder that
+    resolver returns for "no credential" is reported as "" so a probe stays keyless rather than sending
+    a bogus bearer.
+
+    Best-effort: any failure returns "", which is exactly the pre-ATE-18791 behaviour.
+    """
+    origin = base_url_origin(base_url)
+    if not origin[1]:
+        return ""
+    cached = _config_provider_key_cache.get(origin)
+    if cached is not None and time.monotonic() - cached[0] < _CONFIG_PROVIDER_KEY_TTL_SECONDS:
+        return cached[1]
+    try:
+        from hermes_cli import config as _cfg_mod
+
+        providers = (_cfg_mod.load_config() or {}).get("providers") or {}
+        resolved: Any = ""
+        for name, entry in providers.items():
+            if not isinstance(entry, dict):
+                continue
+            if base_url_origin(str(entry.get("base_url") or "")) != origin:
+                continue
+            # One matching provider decides. A second provider on the same origin is a
+            # misconfiguration; borrowing its key would cross exactly the boundary this guards.
+            candidate = _named_custom_api_key(dict(entry), str(name), str(entry.get("base_url") or ""))
+            if isinstance(candidate, str):
+                resolved = "" if candidate in ("", "no-key-required") else candidate
+            else:
+                resolved = candidate  # key_cmd / pool token provider: materialized at probe time
+            break
+    except Exception:
+        logger.debug("Config provider credential lookup failed for %s", base_url, exc_info=True)
+        return ""
+    _config_provider_key_cache[origin] = (time.monotonic(), resolved)
+    return resolved
+
+
+def endpoint_api_key_if_same_origin(base_url: str) -> str | Callable[[], str]:
+    """Public name for the same-origin credential reader: the live turn's key for *base_url*, else "".
+
+    For in-process consumers outside this module that must authenticate an **inspection** call to the
+    endpoint the turn is already using (e.g. the pricing catalogue behind a cost breakdown). Same
+    guarantee as the private reader: an origin mismatch returns "", never another host's credential.
+    """
+    return _read_main_api_key_if_same_origin(base_url)
+
+
 # Compatibility mirrors for older readers/tests; the ContextVar below is
 # authoritative (overlapping gateway sessions make a process-global unsafe).
 _RUNTIME_MAIN_PROVIDER: str = ""
