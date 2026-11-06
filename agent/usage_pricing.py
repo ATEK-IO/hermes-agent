@@ -574,9 +574,21 @@ def resolve_endpoint_api_key(base_url: Optional[str]) -> Any:
     try:
         from agent.auxiliary_client import endpoint_api_key_if_same_origin
 
-        return endpoint_api_key_if_same_origin(str(base_url))
+        key = endpoint_api_key_if_same_origin(str(base_url))
     except Exception:
         logger.debug("Endpoint credential resolution failed for %s", base_url, exc_info=True)
+        return ""
+    if key:
+        return key
+    # No turn bound this endpoint yet (a fresh worker computing a cost, a background flush). The
+    # config-declared provider for the same origin is still the right credential, and it is the only
+    # one that can be: an origin with no provider entry stays keyless.
+    try:
+        from agent.auxiliary_client import endpoint_api_key_from_config_provider
+
+        return endpoint_api_key_from_config_provider(str(base_url))
+    except Exception:
+        logger.debug("Config provider credential resolution failed for %s", base_url, exc_info=True)
         return ""
 
 

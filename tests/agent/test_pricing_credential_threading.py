@@ -180,3 +180,114 @@ class TestInsightsAndAuxAccounting:
         assert seen == {"api_key": "sk-live", "base_url": GW}
         assert len(db.rows) == 1
         assert db.rows[0][2]["estimated_cost_usd"] == pytest.approx(0.25)
+
+
+class TestConfigProviderCredentialFallback:
+    """No bound runtime (fresh worker, background flush): the config-declared provider's own key.
+
+    ATE-18791 measured this on r410: with no turn bound, the same-origin reader returns "" because
+    ``model.api_key`` is empty and the gateway key lives in ``providers.litellm.key_env``. Left at that,
+    the cost path would keep probing keyless in exactly the processes that generate the 401s.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        from agent import auxiliary_client
+
+        auxiliary_client._config_provider_key_cache.clear()
+        yield
+        auxiliary_client._config_provider_key_cache.clear()
+
+    def _bind_config(self, monkeypatch, providers, *, calls=None, error=None):
+        from hermes_cli import config as cfg_mod
+
+        def fake_load_config():
+            if calls is not None:
+                calls.append(1)
+            if error is not None:
+                raise error
+            return {"providers": providers}
+
+        monkeypatch.setattr(cfg_mod, "load_config", fake_load_config)
+
+    def _unbound(self, monkeypatch):
+        from agent import auxiliary_client
+
+        monkeypatch.setattr(auxiliary_client, "endpoint_api_key_if_same_origin", lambda base_url: "")
+
+    def test_key_env_credential_is_used_when_no_runtime_is_bound(self, monkeypatch):
+        from agent import auxiliary_client, usage_pricing
+
+        self._unbound(monkeypatch)
+        self._bind_config(monkeypatch, {"litellm": {"base_url": GW, "key_env": "ATEK_GW_KEY"}})
+        monkeypatch.setattr(
+            auxiliary_client, "_scoped_key_env",
+            lambda name: "sk-config-gateway" if name == "ATEK_GW_KEY" else "",
+        )
+
+        assert usage_pricing.resolve_endpoint_api_key(GW) == "sk-config-gateway"
+
+    def test_inline_api_key_is_used(self, monkeypatch):
+        from agent import auxiliary_client, usage_pricing
+
+        self._unbound(monkeypatch)
+        self._bind_config(monkeypatch, {"litellm": {"base_url": GW, "api_key": "sk-inline"}})
+        monkeypatch.setattr(auxiliary_client, "_scoped_key_env", lambda name: "")
+
+        assert usage_pricing.resolve_endpoint_api_key(GW) == "sk-inline"
+
+    def test_a_different_port_on_the_same_host_never_borrows_the_key(self, monkeypatch):
+        from agent import auxiliary_client, usage_pricing
+
+        self._unbound(monkeypatch)
+        self._bind_config(monkeypatch, {"litellm": {"base_url": GW, "api_key": "sk-inline"}})
+        monkeypatch.setattr(auxiliary_client, "_scoped_key_env", lambda name: "")
+
+        assert usage_pricing.resolve_endpoint_api_key("http://gateway.example.com:4201/v1") == ""
+
+    def test_a_matching_provider_with_no_credential_stays_keyless(self, monkeypatch):
+        from agent import auxiliary_client, usage_pricing
+
+        self._unbound(monkeypatch)
+        self._bind_config(monkeypatch, {"litellm": {"base_url": GW}})
+        monkeypatch.setattr(auxiliary_client, "_scoped_key_env", lambda name: "")
+
+        assert usage_pricing.resolve_endpoint_api_key(GW) == ""
+
+    def test_unknown_origin_stays_keyless(self, monkeypatch):
+        from agent import auxiliary_client, usage_pricing
+
+        self._unbound(monkeypatch)
+        self._bind_config(monkeypatch, {"litellm": {"base_url": GW, "api_key": "sk-inline"}})
+
+        assert usage_pricing.resolve_endpoint_api_key("https://api.other-vendor.com/v1") == ""
+
+    def test_the_live_runtime_credential_wins_and_config_is_not_read(self, monkeypatch):
+        from agent import auxiliary_client, usage_pricing
+
+        calls: list = []
+        monkeypatch.setattr(auxiliary_client, "endpoint_api_key_if_same_origin", lambda base_url: "sk-live")
+        self._bind_config(monkeypatch, {"litellm": {"base_url": GW, "api_key": "sk-inline"}}, calls=calls)
+
+        assert usage_pricing.resolve_endpoint_api_key(GW) == "sk-live"
+        assert calls == []
+
+    def test_one_config_read_per_window(self, monkeypatch):
+        from agent import auxiliary_client, usage_pricing
+
+        calls: list = []
+        self._unbound(monkeypatch)
+        self._bind_config(monkeypatch, {"litellm": {"base_url": GW, "api_key": "sk-inline"}}, calls=calls)
+        monkeypatch.setattr(auxiliary_client, "_scoped_key_env", lambda name: "")
+
+        assert usage_pricing.resolve_endpoint_api_key(GW) == "sk-inline"
+        assert usage_pricing.resolve_endpoint_api_key(GW) == "sk-inline"
+        assert len(calls) == 1
+
+    def test_unreadable_config_is_fail_open(self, monkeypatch):
+        from agent import auxiliary_client, usage_pricing
+
+        self._unbound(monkeypatch)
+        self._bind_config(monkeypatch, {}, error=RuntimeError("config unreadable"))
+
+        assert usage_pricing.resolve_endpoint_api_key(GW) == ""
