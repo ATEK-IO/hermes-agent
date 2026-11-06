@@ -125,9 +125,29 @@ def _fetch_picker_live_models(
     if api_key and not caller_has_authorization:
         _drop(lambda k: k == "authorization")
         candidate_headers["Authorization"] = f"Bearer {api_key}"
+    if not api_key and not caller_has_authorization:
+        # Never put an unauthenticated catalog probe on the wire for an endpoint that declares a
+        # credential: LiteLLM answers a keyless ``GET /v1/models`` with 401 and logs "No api key
+        # passed in" plus a traceback on every picker open (ATE-19359). Adopt the key the endpoint's
+        # own config entry declares; when it does not resolve here, skip the probe instead.
+        # An endpoint that declares no credential at all (local llama.cpp / LM Studio) is probed
+        # exactly as before — reachability is its credential.
+        resolved_key, credential_declared = configured_endpoint_credential(api_url)
+        if resolved_key:
+            api_key = resolved_key
+            _drop(lambda k: k == "authorization")
+            candidate_headers["Authorization"] = f"Bearer {api_key}"
+        elif credential_declared:
+            logger.debug(
+                "Skipping keyless model probe for %s: configured credential did not resolve", api_url)
+            return None
+
     use_native = should_use_ollama_native_catalog(
         native_catalog_provider, api_url, headers=candidate_headers or None)
-    resolved_headers = candidate_headers or None if use_native else headers
+    # The generic branch used to send the caller's raw ``headers``, dropping the Authorization this
+    # function just synthesized; ``candidate_headers`` is the caller's headers plus that key, so
+    # both branches now send what ``probe_api_models`` would have rebuilt anyway.
+    resolved_headers = candidate_headers or None
 
     if use_native:
         if preserve_native_models:
@@ -573,6 +593,54 @@ def _entry_credentials(entry: dict, *key_env_keys: str) -> tuple[Any, str, str]:
         return source, key_env, source.cache_identity
     inline_api_key = str(entry.get("api_key", "") or "").strip()
     return inline_api_key, key_env, inline_api_key or (f"env:{key_env}" if key_env else "")
+
+
+def configured_endpoint_credential(api_url: str) -> tuple[str, bool]:
+    """``(api_key, declared)`` for a configured endpoint, matched on its base URL.
+
+    ``providers:`` entries and ``custom_providers:`` rows are where a custom endpoint's key lives.
+    Callers that hold only a URL (the picker probe, the model-metadata probe) used to fall through
+    to an unauthenticated ``GET /models`` whenever the ``api_key`` they were handed came in empty:
+    LiteLLM answers 401 and logs "No api key passed in" plus a traceback, and because the empty
+    result is cached per credential the probe repeats every TTL forever (ATE-19359).
+
+    ``declared`` separates the two cases a bare empty key conflates — an endpoint with no credential
+    at all (local llama.cpp / LM Studio: probe it, reachability is the credential) from a keyed
+    endpoint whose key simply did not resolve in this process (do not probe it).
+    """
+    url = _norm_url(api_url)
+    if not url:
+        return "", False
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:  # health: config.yaml may be user-edited or mid-migration
+        return "", False
+
+    entries: list[dict] = []
+    providers = cfg.get("providers")
+    if isinstance(providers, dict):
+        entries.extend(entry for entry in providers.values() if isinstance(entry, dict))
+    custom = cfg.get("custom_providers")
+    if isinstance(custom, list):
+        entries.extend(entry for entry in custom if isinstance(entry, dict))
+
+    declared = False
+    for entry in entries:
+        if _norm_url(_entry_base_url(entry)) != url:
+            continue
+        inline_api_key, key_env, _ = _entry_credentials(entry, "key_env", "api_key_env")
+        if not (inline_api_key or key_env or entry.get("key_cmd")):
+            continue
+        declared = True
+        if isinstance(inline_api_key, str) and inline_api_key:
+            return inline_api_key, True
+        if key_env:
+            from hermes_cli.model_switch import _scoped_key_env
+            resolved = _scoped_key_env(key_env)
+            if resolved:
+                return resolved, True
+    return "", declared
 
 
 def _discover_flag(entry: dict):
