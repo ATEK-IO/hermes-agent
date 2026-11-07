@@ -1603,17 +1603,9 @@ def test_same_endpoint_different_extra_headers_not_collapsed(monkeypatch):
     # Two distinct rows, not one collapsed row.
     assert len(rows) == 2, f"expected 2 rows, got {len(rows)}: {rows}"
 
-    # Each tenant was probed with its OWN header set (order-independent). ATE-19359: the probe now
-    # also carries the resolved Authorization, which is shared by both tenants and not what this
-    # pins — compare the routing headers with the credential header filtered out.
-    routing = [(key, url, {k: v for k, v in (headers or {}).items() if k.lower() != "authorization"})
-               for key, url, headers in calls]
-    assert ("shared-key", "http://localhost:8081/v1", {"X-Tenant": "a"}) in routing
-    assert ("shared-key", "http://localhost:8081/v1", {"X-Tenant": "b"}) in routing
-    # ...and both probes were authenticated with the key each row declares.
-    assert all(
-        (headers or {}).get("Authorization") == "Bearer shared-key"
-        for _key, _url, headers in calls), calls
+    # Each tenant was probed with its OWN header set (order-independent).
+    assert ("shared-key", "http://localhost:8081/v1", {"X-Tenant": "a"}) in calls
+    assert ("shared-key", "http://localhost:8081/v1", {"X-Tenant": "b"}) in calls
 
     # Each row surfaces the model list its own headers unlocked.
     models_by_row = {tuple(r["models"]) for r in rows}
