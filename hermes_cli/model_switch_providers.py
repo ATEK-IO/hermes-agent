@@ -92,7 +92,8 @@ class _NativePickerModelList(list[str]):
 def _fetch_picker_live_models(
     api_key: Any, api_url: str, native_catalog_provider: str, preserve_native_models: bool,
     headers: dict[str, str] | None = None, timeout: float = 5.0,
-    api_mode: str | None = None, *, cache: bool = True) -> list[str] | None:
+    api_mode: str | None = None, *, cache: bool = True,
+    credential_identity: str | None = None) -> list[str] | None:
     """Fetch picker models with native Ollama and cached generic discovery."""
     from hermes_cli.models import _get_ollama_native_headers, cached_fetch_api_models, fetch_api_models
     from hermes_cli.models_local import (
@@ -108,7 +109,8 @@ def _fetch_picker_live_models(
             api_key, api_url, timeout=timeout, headers=headers, api_mode=api_mode,
             fetch_models=lambda: _fetch_picker_live_models(
                 materialize_probe_api_key(api_key), api_url, native_catalog_provider,
-                preserve_native_models, headers, timeout, api_mode, cache=False))
+                preserve_native_models, headers, timeout, api_mode, cache=False,
+                credential_identity=credential_identity))
 
     candidate_headers = _get_ollama_native_headers(api_url, api_key=api_key)
 
@@ -122,12 +124,41 @@ def _fetch_picker_live_models(
         lowered = {existing.lower() for existing in headers}
         _drop(lambda k: k in lowered)
         candidate_headers.update(headers)
-    if api_key and not caller_has_authorization:
-        _drop(lambda k: k == "authorization")
-        candidate_headers["Authorization"] = f"Bearer {api_key}"
+    # ``probe_api_models`` builds the request's authentication itself from ``api_key`` — a bearer,
+    # or ``x-api-key`` + ``anthropic-version`` for ``anthropic_messages`` — and merges
+    # ``request_headers`` last. So the generic branch keeps the caller's ``headers`` and never
+    # synthesizes a credential header: doing it here is how a bearer the probe never sends for
+    # ``anthropic_messages`` reached the wire (Code Reviewer, PR #20 MAJOR 2). The native catalog
+    # fetch takes headers only, so that branch is the one place the key must be a header.
+    if not api_key and not caller_has_authorization:
+        # Never put an unauthenticated catalog probe on the wire for an endpoint that declares a
+        # credential: LiteLLM answers a keyless ``GET /v1/models`` with 401 and logs "No api key
+        # passed in" plus a traceback on every picker open (ATE-19359). Adopt the key the endpoint's
+        # own config entry declares; when it does not resolve here, skip the probe instead.
+        # An endpoint that declares no credential at all (local llama.cpp / LM Studio) is probed
+        # exactly as before — reachability is its credential.
+        resolved_key, credential_declared = configured_endpoint_credential(api_url, credential_identity)
+        if resolved_key:
+            api_key = resolved_key
+        elif credential_declared:
+            logger.debug(
+                "Skipping keyless model probe for %s: configured credential did not resolve", api_url)
+            return None
+
     use_native = should_use_ollama_native_catalog(
         native_catalog_provider, api_url, headers=candidate_headers or None)
-    resolved_headers = candidate_headers or None if use_native else headers
+    # The generic probe builds its own auth from ``api_key`` (bearer, or ``x-api-key`` for
+    # ``anthropic_messages``), so a caller-supplied key needs no header here and a recovered one is
+    # added only by the branch below. The native catalog fetch takes headers only, so it needs the
+    # key on ``candidate_headers`` — ``_get_ollama_native_headers`` already put a caller's key there;
+    # this covers a key recovered after that call.
+    if use_native and api_key and not caller_has_authorization:
+        _drop(lambda k: k == "authorization")
+        candidate_headers["Authorization"] = f"Bearer {api_key}"
+    # Base semantics for the generic branch: it sends the caller's ``headers``; the key travels as
+    # ``api_key`` and ``probe_api_models`` builds auth from it. The native branch needs its headers
+    # dict to carry the key, because ``fetch_ollama_local_models`` builds nothing itself.
+    resolved_headers = (candidate_headers or None) if use_native else headers
 
     if use_native:
         if preserve_native_models:
@@ -575,6 +606,80 @@ def _entry_credentials(entry: dict, *key_env_keys: str) -> tuple[Any, str, str]:
     return inline_api_key, key_env, inline_api_key or (f"env:{key_env}" if key_env else "")
 
 
+def configured_endpoint_credential(
+    api_url: str, credential_identity: str | None = None
+) -> tuple[str, bool]:
+    """``(api_key, declared)`` for the configured entry *credential_identity* names on *api_url*.
+
+    ``providers:`` entries and ``custom_providers:`` rows are where a custom endpoint's key lives.
+    Callers that hold only a URL (the picker probe, the model-metadata probe) used to fall through
+    to an unauthenticated ``GET /models`` whenever the ``api_key`` they were handed came in empty:
+    LiteLLM answers 401 and logs "No api key passed in" plus a traceback, and because the empty
+    result is cached per credential the probe repeats every TTL forever (ATE-19359).
+
+    ``declared`` separates the two cases a bare empty key conflates — an endpoint with no credential
+    at all (local llama.cpp / LM Studio: probe it, reachability is the credential) from a keyed
+    endpoint whose key simply did not resolve in this process (do not probe it).
+
+    Matching is on ``(base URL, credential identity)``, never on the URL alone: N rows may share one
+    proxy URL with distinct keys, and a row whose own key did not resolve must not authenticate as
+    its sibling and show that tenant's catalog as its own (Code Reviewer, PR #20 MAJOR 1).
+    ``credential_identity`` is the string ``_entry_credentials`` already gives the row builders
+    (inline key, ``env:NAME`` or a command-token cache identity). ``None`` means the caller has no
+    row to name (the bare ``model:`` endpoint): a key is then returned only when every declaring
+    entry on that URL resolves to one identity. An ambiguous URL declares a credential but yields
+    no key, so the probe is skipped rather than sent as another row's tenant.
+    """
+    url = _norm_url(api_url)
+    if not url:
+        return "", False
+    try:
+        from hermes_cli.config import is_provider_enabled, load_config
+        cfg = load_config() or {}
+    except Exception:  # health: config.yaml may be user-edited or mid-migration
+        return "", False
+
+    # Each source keeps the key-env spelling its own row builder reads, so an identity computed here
+    # is the same string that builder grouped the row on.
+    entries: list[tuple[dict, tuple[str, ...]]] = []
+    providers = cfg.get("providers")
+    if isinstance(providers, dict):
+        entries.extend(
+            (entry, ("key_env", "api_key_env"))
+            for entry in providers.values()
+            if isinstance(entry, dict) and is_provider_enabled(entry))
+    custom = cfg.get("custom_providers")
+    if isinstance(custom, list):
+        entries.extend((entry, ("key_env",)) for entry in custom if isinstance(entry, dict))
+
+    declared = False
+    resolved: dict[str, str] = {}
+    for entry, key_env_keys in entries:
+        if _norm_url(_entry_base_url(entry)) != url:
+            continue
+        inline_api_key, key_env, identity = _entry_credentials(entry, *key_env_keys)
+        if credential_identity is not None and identity != credential_identity:
+            continue
+        if not (inline_api_key or key_env or entry.get("key_cmd")):
+            continue
+        declared = True
+        if isinstance(inline_api_key, str) and inline_api_key:
+            found = inline_api_key
+        elif key_env:
+            from hermes_cli.model_switch import _scoped_key_env
+            found = _scoped_key_env(key_env) or ""
+        else:  # key_cmd: minting a command token is the caller's job, not the lookup's
+            found = ""
+        if not found:
+            continue
+        if credential_identity is not None:
+            return found, True
+        resolved[identity] = found
+    if credential_identity is None and len(resolved) == 1:
+        return next(iter(resolved.values())), True
+    return "", declared
+
+
 def _discover_flag(entry: dict):
     """``discover_models`` (default True); ``"false"/"no"/"0"`` strings mean False."""
     discover = entry.get("discover_models", True)
@@ -603,7 +708,7 @@ def _group_display_name(display_name: str) -> str:
 def _discover_endpoint_models(
     api_key: Any, api_url: str, native_catalog_provider: str, has_explicit_models: bool, *,
     headers: dict | None, api_mode: str | None, probe_live: bool, discovery_allowed: bool,
-    fast_custom_probe: bool) -> tuple[list | None, bool]:
+    fast_custom_probe: bool, credential_identity: str | None = None) -> tuple[list | None, bool]:
     """Return ``(models, native_catalog_empty)`` for a custom endpoint row.
 
     ``probe_live`` runs the native-aware picker fetch; otherwise, when discovery is allowed, a
@@ -621,7 +726,8 @@ def _discover_endpoint_models(
         try:
             live_models = _fetch_picker_live_models(
                 api_key, api_url, native_catalog_provider, has_explicit_models,
-                headers=headers, timeout=timeout, api_mode=api_mode)
+                headers=headers, timeout=timeout, api_mode=api_mode,
+                credential_identity=credential_identity)
             is_native = isinstance(live_models, _NativePickerModelList)
             if is_native and has_explicit_models:
                 return None, False
@@ -797,6 +903,7 @@ class _PickerBuild:
     def discover_endpoint(
         self, api_key: Any, api_url: str, native_provider: str, has_explicit_models: bool, *,
         headers: dict | None, api_mode: str | None, discovery_allowed: bool, is_current: bool,
+        credential_identity: str | None = None,
     ) -> tuple[list | None, bool, bool]:
         """Probe policy shared by sections 3 and 4 (returns ``(models, native_empty, probed)``):
         with an api_key live /models is the source of truth (replaces the partial ``models:``
@@ -809,7 +916,8 @@ class _PickerBuild:
         discovered, native_catalog_empty = _discover_endpoint_models(
             api_key, api_url, native_provider, has_explicit_models,
             headers=headers, api_mode=api_mode, probe_live=probe_live,
-            discovery_allowed=discovery_allowed, fast_custom_probe=self.resolved_fast_custom_probe)
+            discovery_allowed=discovery_allowed, fast_custom_probe=self.resolved_fast_custom_probe,
+            credential_identity=credential_identity)
         return discovered, native_catalog_empty, probe_live
 
 
@@ -1008,6 +1116,7 @@ def _lap_user_provider_rows(b: _PickerBuild, user_providers: dict) -> None:
                 "slug": ep_name, "name": _group_display_name(display_name), "api_url": api_url, "models": [],
                 "has_explicit_models": False,
                 "api_key": inline_api_key or _scoped_key_env(key_env),
+                "credential_identity": cred_identity,
                 "headers": headers, "api_mode": ep_cfg.get("api_mode"),
                 "discovery_allowed": bool(api_url) and _discover_flag(ep_cfg), "raw_names": [], "aliases": set()}
         grp = ep_groups[group_key]
@@ -1030,7 +1139,8 @@ def _lap_user_provider_rows(b: _PickerBuild, user_providers: dict) -> None:
             grp["api_key"], api_url,
             ep_name if str(ep_name).strip().lower() in {"ollama", "custom:ollama"} else "custom",
             grp["has_explicit_models"], headers=grp["headers"] or None, api_mode=grp["api_mode"],
-            discovery_allowed=grp["discovery_allowed"], is_current=is_current)
+            discovery_allowed=grp["discovery_allowed"], is_current=is_current,
+            credential_identity=grp.get("credential_identity"))
         if discovered is not None:
             models_list = discovered
 
@@ -1164,7 +1274,7 @@ def _lap_custom_provider_rows(b: _PickerBuild, custom_providers: list) -> None:
             "ollama" if "ollama" in {str(slug).strip().lower(), str(grp.get("name") or "").strip().lower()} else "custom",
             bool(grp.get("has_explicit_models")), headers=grp.get("extra_headers") or None,
             api_mode=grp.get("api_mode"), discovery_allowed=bool(api_url) and grp.get("discover_models", True),
-            is_current=is_current)
+            is_current=is_current, credential_identity=grp.get("credential_identity"))
         if discovered is not None:
             grp["models"] = discovered
             if probe_live:  # a successful live probe persists the catalog for no-probe surfaces
