@@ -852,6 +852,10 @@ class TestFetchEndpointModelMetadata:
         import agent.model_metadata as mm
         mm._endpoint_model_metadata_cache.clear()
         mm._endpoint_model_metadata_cache_time.clear()
+        # The auth-refusal and connect-timeout verdicts are module-level and host-keyed, and these
+        # tests reuse https://custom.example/v1: without clearing them a 401 test silences the rest.
+        mm._endpoint_unauth_probe_cache.clear()
+        mm._endpoint_blackhole_cache.clear()
 
     @pytest.mark.parametrize("status_code", [401, 403])
     def test_auth_failure_stops_after_first_candidate(self, status_code):
