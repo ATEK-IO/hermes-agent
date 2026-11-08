@@ -571,13 +571,16 @@ def resolve_endpoint_api_key(base_url: Optional[str]) -> Any:
     """
     if not base_url:
         return ""
+    key: Any = ""
     try:
         from agent.auxiliary_client import endpoint_api_key_if_same_origin
 
         key = endpoint_api_key_if_same_origin(str(base_url))
     except Exception:
+        # A transient fault in the live reader must not decide the outcome: the config-declared
+        # provider is an independent source for the same origin, so fall through to it instead of
+        # returning "" here and leaving the probe keyless (ATE-18829).
         logger.debug("Endpoint credential resolution failed for %s", base_url, exc_info=True)
-        return ""
     if key:
         return key
     # No turn bound this endpoint yet (a fresh worker computing a cost, a background flush). The

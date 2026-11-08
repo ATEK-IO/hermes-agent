@@ -2527,9 +2527,36 @@ def _read_main_api_key_if_same_origin(aux_base_url: str) -> str | Callable[[], s
 
 
 _CONFIG_PROVIDER_KEY_TTL_SECONDS = 300.0
-# origin -> (monotonic ts, credential); credentials only, never a URL, so a stale entry cannot
-# redirect a key — it can only keep serving or stop serving the same origin's own credential.
-_config_provider_key_cache: dict[tuple[str, str, int], tuple[float, Any]] = {}
+# (secret-scope key, origin) -> (monotonic ts, credential); credentials only, never a URL, so a
+# stale entry cannot redirect a key — it can only keep serving or stop serving the same origin's
+# own credential. The scope is part of the key because the credential is materialized *under the
+# binding in force* (``key_env`` reads through ``get_secret``): one process serving two profiles
+# from one origin must never answer the second with the first profile's key (ATE-18829).
+_config_provider_key_cache: dict[tuple[str, tuple[str, str, int]], tuple[float, Any]] = {}
+
+
+def _config_provider_scope_key() -> Optional[str]:
+    """Identify the secret binding a config-provider credential would be resolved under.
+
+    The stamped profile home names it (``current_secret_scope_home``); with no scope bound the
+    process's own home does, which is the fresh-worker path this fallback exists for.
+
+    ``None`` means the binding is **not identifiable**: an unstamped scope is another profile's
+    mapping with no home to name it, so two of those on one origin would share one cache entry —
+    the silent cross-profile key leak the key exists to prevent. Such a caller is served fresh.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, current_secret_scope_home
+
+        home = current_secret_scope_home()
+        if home:
+            return hermes_home_key(home)
+        if current_secret_scope() is None:
+            return hermes_home_key()
+        return None
+    except Exception:
+        logger.debug("Secret scope could not be identified; not caching a provider credential", exc_info=True)
+        return None
 
 
 def endpoint_api_key_from_config_provider(base_url: str) -> Any:
@@ -2541,17 +2568,24 @@ def endpoint_api_key_from_config_provider(base_url: str) -> Any:
     the live reader follows — so it can never pair one host's URL with another's key. Every credential
     form the main client honours is honoured here (inline ``api_key``, ``key_env`` through the profile
     secret scope, ``key_cmd``/credential pool via ``_named_custom_api_key``), and the placeholder that
-    resolver returns for "no credential" is reported as "" so a probe stays keyless rather than sending
+    the resolver returns for "no credential" is reported as "" so a probe stays keyless rather than sending
     a bogus bearer.
+
+    The result is cached **per secret scope and origin**: the materialized value belongs to the profile
+    whose ``get_secret`` produced it, and a second profile on the same origin gets its own resolution
+    (or none, when its scope cannot be identified), never this one.
 
     Best-effort: any failure returns "", which is exactly the pre-ATE-18791 behaviour.
     """
     origin = base_url_origin(base_url)
     if not origin[1]:
         return ""
-    cached = _config_provider_key_cache.get(origin)
-    if cached is not None and time.monotonic() - cached[0] < _CONFIG_PROVIDER_KEY_TTL_SECONDS:
-        return cached[1]
+    scope_key = _config_provider_scope_key()
+    cache_key = ("" if scope_key is None else scope_key, origin)
+    if scope_key is not None:
+        cached = _config_provider_key_cache.get(cache_key)
+        if cached is not None and time.monotonic() - cached[0] < _CONFIG_PROVIDER_KEY_TTL_SECONDS:
+            return cached[1]
     try:
         from hermes_cli import config as _cfg_mod
 
@@ -2573,7 +2607,8 @@ def endpoint_api_key_from_config_provider(base_url: str) -> Any:
     except Exception:
         logger.debug("Config provider credential lookup failed for %s", base_url, exc_info=True)
         return ""
-    _config_provider_key_cache[origin] = (time.monotonic(), resolved)
+    if scope_key is not None:
+        _config_provider_key_cache[cache_key] = (time.monotonic(), resolved)
     return resolved
 
 

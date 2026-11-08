@@ -291,3 +291,90 @@ class TestConfigProviderCredentialFallback:
         self._bind_config(monkeypatch, {}, error=RuntimeError("config unreadable"))
 
         assert usage_pricing.resolve_endpoint_api_key(GW) == ""
+
+    def test_two_bound_scopes_on_one_origin_each_resolve_their_own_key(self, monkeypatch):
+        """The credential is materialized under the bound scope, so the cache key must carry it.
+
+        One process serves profile A then profile B from the same gateway origin. A cache keyed on
+        the origin alone answers B with A's key — the silent default-profile leak ``AGENTS.md``
+        bans (ATE-18829).
+        """
+        from agent import usage_pricing
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+        calls: list = []
+        self._unbound(monkeypatch)
+        self._bind_config(monkeypatch, {"litellm": {"base_url": GW, "key_env": "ATEK_GW_KEY"}}, calls=calls)
+
+        token = set_secret_scope({"ATEK_GW_KEY": "first-scope-key"}, profile_home="/srv/hermes/profiles/first")
+        try:
+            assert usage_pricing.resolve_endpoint_api_key(GW) == "first-scope-key"
+        finally:
+            reset_secret_scope(token)
+
+        token = set_secret_scope({"ATEK_GW_KEY": "second-scope-key"}, profile_home="/srv/hermes/profiles/second")
+        try:
+            assert usage_pricing.resolve_endpoint_api_key(GW) == "second-scope-key"
+        finally:
+            reset_secret_scope(token)
+
+        # One config read per scope, not one per process: the second scope is not served from A's entry.
+        assert len(calls) == 2
+
+    def test_the_same_scope_is_cached_across_calls(self, monkeypatch):
+        from agent import usage_pricing
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+        calls: list = []
+        self._unbound(monkeypatch)
+        self._bind_config(monkeypatch, {"litellm": {"base_url": GW, "key_env": "ATEK_GW_KEY"}}, calls=calls)
+
+        token = set_secret_scope({"ATEK_GW_KEY": "scoped-key"}, profile_home="/srv/hermes/profiles/only")
+        try:
+            assert usage_pricing.resolve_endpoint_api_key(GW) == "scoped-key"
+            assert usage_pricing.resolve_endpoint_api_key(GW) == "scoped-key"
+        finally:
+            reset_secret_scope(token)
+
+        assert len(calls) == 1
+
+    def test_an_unstamped_scope_is_never_served_from_the_cache(self, monkeypatch):
+        """An unstamped mapping names no home, so two of them cannot be told apart by a key.
+
+        Such a caller is resolved fresh and never stored — serving one profile's materialized
+        credential to another is the failure, not an extra config read.
+        """
+        from agent import auxiliary_client, usage_pricing
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+        calls: list = []
+        self._unbound(monkeypatch)
+        self._bind_config(monkeypatch, {"litellm": {"base_url": GW, "key_env": "ATEK_GW_KEY"}}, calls=calls)
+
+        token = set_secret_scope({"ATEK_GW_KEY": "unstamped-first"})
+        try:
+            assert usage_pricing.resolve_endpoint_api_key(GW) == "unstamped-first"
+        finally:
+            reset_secret_scope(token)
+
+        token = set_secret_scope({"ATEK_GW_KEY": "unstamped-second"})
+        try:
+            assert usage_pricing.resolve_endpoint_api_key(GW) == "unstamped-second"
+        finally:
+            reset_secret_scope(token)
+
+        assert len(calls) == 2
+        assert auxiliary_client._config_provider_key_cache == {}
+
+    def test_a_live_reader_fault_still_falls_through_to_the_config_provider(self, monkeypatch):
+        """A transient normaliser fault in the live reader must not leave the probe keyless."""
+        from agent import auxiliary_client, usage_pricing
+
+        def _boom(base_url):
+            raise RuntimeError("live reader fault")
+
+        monkeypatch.setattr(auxiliary_client, "endpoint_api_key_if_same_origin", _boom)
+        self._bind_config(monkeypatch, {"litellm": {"base_url": GW, "api_key": "inline-placeholder-key"}})
+        monkeypatch.setattr(auxiliary_client, "_scoped_key_env", lambda name: "")
+
+        assert usage_pricing.resolve_endpoint_api_key(GW) == "inline-placeholder-key"
