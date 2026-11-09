@@ -32,6 +32,10 @@ from agent.error_classifier import (
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 from agent.errors import EmptyStreamError
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
+from agent.request_deadline import (
+    RequestDeadlineExceeded,
+    resolve_request_deadline_seconds,
+)
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
@@ -2754,6 +2758,13 @@ class _StreamingCall(StreamingWaitMonitor):
         # Shared by the socket read timeout (``_stream_timeouts``) and the stale
         # detector (``_resolve_stale_timeout``); None until resolved.
         self._stream_stale_timeout = None
+        # One attempt must not inherit the whole run budget (ATE-21375): the
+        # wall-clock deadline below is per attempt, cut by the monitor loop.
+        self.request_deadline_seconds = resolve_request_deadline_seconds(agent)
+        self._request_deadline_started_at: Optional[float] = None
+        self._request_deadline_attempt: tuple[int, int] = (0, 0)
+        self._request_deadline_fired = {"value": False}
+        self._request_deadline_last_elapsed = 0.0
         self.stream_attempt_lock = threading.Lock()
         self.stream_attempt_state = {"current": 0, "cancelled": set(), "discarded_chunks": 0, "discarded_bytes": 0}
         self._stale_counted_attempts: set[int] = set()  # breaker counts each attempt once
@@ -3588,7 +3599,11 @@ class _StreamingCall(StreamingWaitMonitor):
         _is_stream_parse_err = self.agent._is_provider_stream_parse_error(e)
         _is_empty_stream = isinstance(e, EmptyStreamError)
         _is_sse_conn_err = not _is_timeout and not _is_conn_err and _is_sse_connection_error(e)
-        _is_transient = _is_timeout or _is_conn_err or _is_sse_conn_err or _is_stream_parse_err
+        # Our own wall-clock deadline kill (ATE-21375) is transient by construction:
+        # the retry loop owns recovery, and the last attempt's instance becomes the
+        # turn's error with the deadline named instead of ReadTimeout.
+        _is_deadline = isinstance(e, RequestDeadlineExceeded)
+        _is_transient = _is_timeout or _is_conn_err or _is_sse_conn_err or _is_stream_parse_err or _is_deadline
 
         if not self.deltas_were_sent["yes"] and not getattr(self.agent, "_stream_options_unsupported", False) and _rejects_stream_options(e):
             # Nothing streamed yet: drop the usage extension for this session and re-open.
@@ -3747,6 +3762,8 @@ class _StreamingCall(StreamingWaitMonitor):
             while _stream_attempt < _max_stream_retries + self._compat_retries:
                 _stream_attempt += 1
                 stream_attempt_id = self._start_stream_attempt()
+                # Each attempt carries its own wall-clock budget (ATE-21375).
+                self._arm_request_deadline(_stream_attempt, _max_stream_retries + 1)
                 # Otherwise /stop closes the connection and the retry opens a
                 # FRESH one, blocking up to a full read timeout per attempt.
                 if self.agent._interrupt_requested:
@@ -3755,9 +3772,12 @@ class _StreamingCall(StreamingWaitMonitor):
                 try:
                     self.result["response"] = _with_stream_emitters(
                         self.agent, lambda: self._call_wire(stream_attempt_id))
+                    self._disarm_request_deadline()
                     return  # success
                 except Exception as e:
                     self._close_managed_stream()
+                    # The deadline kill surfaces as a transport error; name it.
+                    e = self._request_deadline_error(e, _stream_attempt, _max_stream_retries + 1)
                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
                         return
                     if self._route_switched_under_request():
@@ -3768,6 +3788,7 @@ class _StreamingCall(StreamingWaitMonitor):
             self.result["error"] = e
             return
         finally:
+            self._disarm_request_deadline()
             self._close_managed_stream()
             # Reuse only after a clean stream; otherwise really close (fresh pool next).
             self.clients.close_once(
@@ -3822,6 +3843,75 @@ class _StreamingCall(StreamingWaitMonitor):
         if attempt:
             self._stale_counted_attempts.add(attempt)
             _bump_stale_streak(self.agent)
+
+    def _arm_request_deadline(self, attempt: int, max_attempts: int) -> None:
+        """Start this attempt's wall-clock budget (ATE-21375).
+
+        A deadline is per **request**, not per stream and not per run: the retry
+        loop arms a fresh one for every attempt, so a stalled call costs at most
+        ``request_deadline_seconds`` instead of the run's whole transport budget.
+        """
+        self._request_deadline_attempt = (int(attempt), int(max_attempts))
+        self._request_deadline_fired["value"] = False
+        self._request_deadline_started_at = (
+            None if self.request_deadline_seconds == float("inf") else time.monotonic())
+
+    def _disarm_request_deadline(self) -> None:
+        self._request_deadline_started_at = None
+
+    def _request_deadline_error(self, e: Exception, attempt: int, max_attempts: int) -> Exception:
+        """Name a deadline cut.
+
+        The kill aborts the request-local socket, so the worker unwinds with a
+        transport error (ReadError/ReadTimeout). Without this the record would say
+        ``ReadTimeout`` or ``unknown`` and hide the real cause (ATE-21346).
+        """
+        if not self._request_deadline_fired["value"]:
+            return e
+        if isinstance(e, RequestDeadlineExceeded) or self._request_cancelled["value"]:
+            return e
+        logger.warning(
+            "Model call was killed at its %.0fs request deadline (attempt %s/%s); "
+            "surfacing that instead of the transport error %s",
+            self.request_deadline_seconds, attempt, max_attempts, type(e).__name__)
+        return RequestDeadlineExceeded(
+            self._request_deadline_last_elapsed, self.request_deadline_seconds,
+            attempt=attempt, max_attempts=max_attempts)
+
+    def _kill_request_deadline(self, elapsed: float) -> None:
+        """One attempt outlived its wall-clock deadline: cut it, retry opens a new one.
+
+        Same abort path as the stale kill — cancel the attempt and shut down only
+        its request-local socket (never ``close()`` a live TLS descriptor from this
+        stranger thread) — but it does NOT strike the cross-turn stale breaker: a
+        long reasoning stream cut by policy is not evidence the provider is dead.
+        """
+        attempt, max_attempts = self._request_deadline_attempt
+        self._request_deadline_fired["value"] = True
+        self._request_deadline_last_elapsed = float(elapsed)
+        self._request_deadline_started_at = None  # once per attempt; no kill storm while unwinding
+        try:
+            _ctx = f"{estimate_request_context_tokens(self.api_kwargs):,}"
+        except Exception:
+            _ctx = "?"
+        logger.warning(
+            "Model call exceeded its request deadline: %.0fs elapsed > %.0fs (attempt %s/%s). "
+            "model=%s context=~%s tokens. Killing this attempt; the retry loop opens a fresh one.",
+            elapsed, self.request_deadline_seconds, attempt, max_attempts,
+            self.api_kwargs.get("model", "unknown"), _ctx)
+        _killed_response = self._attempt_stream_response
+        with contextlib.suppress(Exception):
+            self._cancel_current_stream_attempt("request_deadline_kill")
+            self.clients.close_once("request_deadline_kill")
+        self._shutdown_stale_attempt_socket(_killed_response)
+        with contextlib.suppress(Exception):
+            self.agent._buffer_diagnostic_status(
+                f"⚠  Model call hit its {int(self.request_deadline_seconds)}s request deadline "
+                f"(attempt {attempt}/{max_attempts}) — reconnecting...")
+            self.agent._emit_diagnostic_wait(
+                f"⚠ model call exceeded its {int(self.request_deadline_seconds)}s deadline — reconnecting...")
+            self.agent._touch_activity(
+                f"model call exceeded its {int(self.request_deadline_seconds)}s deadline, reconnecting")
 
     def _kill_stale_stream(self, elapsed: float) -> None:
         """SSE pings but no chunks: cancel the attempt and abort the request-local
