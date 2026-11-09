@@ -469,6 +469,12 @@ def _install_single_query_signal_handlers(cli):
         for _name in ("SIGINT", "SIGTERM", "SIGHUP"):
             if hasattr(_signal, _name):
                 _signal.signal(getattr(_signal, _name), _signal_handler_q)
+    # ATE-21375: name the process that signals this run child (si_pid/si_code).
+    # Installed AFTER the handlers above: the tap restores the action it finds and
+    # re-raises into it, so the interrupt path above is unchanged. Best effort.
+    with suppress(Exception):
+        from agent.signal_source import install_signal_source_capture
+        install_signal_source_capture()
 
 
 def _configure_quiet_agent(agent) -> None:
