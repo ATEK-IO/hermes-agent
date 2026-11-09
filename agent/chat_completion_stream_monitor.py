@@ -84,6 +84,18 @@ class StreamingWaitMonitor:
                 self._mon.wait_notice_started_ts = None  # Reconnect status has its own owner.
                 self._mon.wait_notice.reset()
                 self._kill_stale_stream(_stale_elapsed)
+            # Per-attempt wall-clock deadline (ATE-21375). Unlike the stale check
+            # above this fires while bytes keep arriving, so a keepalive-only or
+            # very long stream cannot consume the run's whole transport budget.
+            _deadline_started = getattr(self, "_request_deadline_started_at", None)
+            _kill_deadline = getattr(self, "_kill_request_deadline", None)
+            _deadline_seconds = getattr(self, "request_deadline_seconds", float("inf"))
+            if _deadline_started is not None and _kill_deadline is not None:
+                _deadline_elapsed = time.monotonic() - _deadline_started
+                if _deadline_elapsed > _deadline_seconds:
+                    self._mon.wait_notice_started_ts = None
+                    self._mon.wait_notice.reset()
+                    _kill_deadline(_deadline_elapsed)
             if self.agent._interrupt_requested:
                 self._abort_for_interrupt(_stale_elapsed)
                 return
